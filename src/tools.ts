@@ -3,7 +3,8 @@
 // Each tool reproduces the logic of the matching GrowwStacks OS server action
 // (lib/actions/*.ts), because we talk to Neon directly instead of calling the
 // app. Every statement is a Neon tagged template (parameterised) and every call
-// goes through asUser/asUserMany so RLS authorizes it.
+// goes through asUser/asUserMany so RLS authorizes it — as the SIGNED-IN OS
+// user (`actor`, resolved per request by auth.ts), not a shared account.
 //
 // Conventions taken from the OS schema — do NOT change:
 //   * display_id is trigger-assigned — never set it.
@@ -12,7 +13,8 @@
 //   * "Delete" means archive-with-reason; no tool here deletes anything.
 
 import { z } from 'zod';
-import { asUser, asUserMany, asUserWithReason, asNamedUser, actorUid, type Env } from './db';
+import type { Identity } from './auth';
+import { asUser, asUserMany, asUserWithReason, asNamedUser, type Actor, type Env } from './db';
 import {
   ALLOWED_MIME,
   MAX_FILE_BYTES,
@@ -330,9 +332,9 @@ const COMPANY_SIZE = z.enum(['1-10', '11-50', '50-200', '200+']);
  * chosen row's name, so we must set industry_id, not the text column. Unknown
  * names are rejected with the valid list rather than silently dropped.
  */
-async function resolveIndustry(env: Env, name?: string): Promise<string | null> {
+async function resolveIndustry(actor: Actor, name?: string): Promise<string | null> {
   if (!name) return null;
-  const rows = await asUser<{ id: string; name: string }>(env, (sql) => sql`
+  const rows = await asUser<{ id: string; name: string }>(actor, (sql) => sql`
     SELECT id, name FROM industries WHERE archived_at IS NULL
   `);
   const hit = rows.find((r) => r.name.toLowerCase() === name.trim().toLowerCase());
@@ -353,9 +355,9 @@ async function resolveIndustry(env: Env, name?: string): Promise<string | null> 
  * REJECT them and name the valid options: a silent drop loses data the caller
  * believed it had set.
  */
-async function normaliseApps(env: Env, requested: string[]): Promise<string[]> {
+async function normaliseApps(actor: Actor, requested: string[]): Promise<string[]> {
   if (requested.length === 0) return [];
-  const valid = await asUser<{ name: string }>(env, (sql) => sql`
+  const valid = await asUser<{ name: string }>(actor, (sql) => sql`
     SELECT name FROM project_app_catalog WHERE archived_at IS NULL
   `);
   const canonical = new Map(valid.map((v) => [v.name.toLowerCase(), v.name]));
@@ -388,7 +390,15 @@ function changedFields(a: Record<string, unknown>, idKey: string): string[] {
   );
 }
 
-export function registerTools(server: ToolServer, env: Env, origin = ''): void {
+export function registerTools(
+  server: ToolServer,
+  env: Env,
+  origin: string,
+  identity: Identity,
+): void {
+  // Every query below runs as the signed-in OS user, so RLS applies THEIR permissions.
+  const actor: Actor = { env, uid: identity.id };
+
   // =========================================================================
   // 0. COMPANIES — the ACCOUNT. A contact is a person; a company is the
   //    organisation they belong to. The "create a company" intake (name,
@@ -420,7 +430,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       about: z.string().max(5000).optional(),
     },
     guard(async (a: any) => {
-      const industryId = await resolveIndustry(env, val<string>(a.industry) ?? undefined);
+      const industryId = await resolveIndustry(actor, val<string>(a.industry) ?? undefined);
       // "Indore, MP, India" -> city / state / country, last part first so a
       // one-part answer lands in country rather than being dropped.
       const parts = (val<string>(a.location) ?? '')
@@ -430,7 +440,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       const country = parts.length >= 1 ? parts[parts.length - 1] : null;
       const state = parts.length >= 3 ? parts[parts.length - 2] : null;
       const city = parts.length >= 2 ? parts[0] : null;
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         INSERT INTO companies (
           name, website, industry_id, company_size, city, state, country,
           type, about, account_owner_id
@@ -482,8 +492,8 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       if (given.length === 0 && clear.length === 0) {
         throw new Error('Pass at least one field to change or clear.');
       }
-      const industryId = await resolveIndustry(env, a.industry);
-      const rows = await asUser(env, (sql) => sql`
+      const industryId = await resolveIndustry(actor, a.industry);
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE companies SET
           name             = COALESCE(${a.name ?? null}, name),
           type             = COALESCE(${a.type ?? null}::company_type, type),
@@ -514,7 +524,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT c.id, c.display_id, c.name, c.type::text AS type, c.website,
                c.industry, c.company_size::text AS company_size,
                c.city, c.state, c.country, c.account_owner_id,
@@ -536,7 +546,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Set who owns a company account.',
     { company_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE companies SET account_owner_id = ${a.user_id}::uuid, updated_at = now()
         WHERE id = ${a.company_id}::uuid AND archived_at IS NULL
         RETURNING id, display_id, name, account_owner_id
@@ -551,7 +561,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'The controlled industry vocabulary. Call before create_company so you offer real options.',
     {},
     guard(async () =>
-      asUser(env, (sql) => sql`
+      asUser(actor, (sql) => sql`
         SELECT id, name FROM industries WHERE archived_at IS NULL ORDER BY name
       `),
     ),
@@ -570,9 +580,9 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       ),
       primary_owner_id: askOrSkip(
         z.string().uuid(),
-        'the MCP system account ends up owning it, which is usually wrong',
+        'you, the signed-in user, become the owner',
       ).describe(
-        'REQUIRED — ask the user who owns this contact, then use find_user. Pass "skip" only if they genuinely have no owner in mind.',
+        'REQUIRED — ask the user who owns this contact, then use find_user. Pass "skip" only if they genuinely have no owner in mind; skipping makes you, the signed-in user, the owner.',
       ),
       company_id: askOrSkip(z.string().uuid(), 'the contact has no company').describe(
         'REQUIRED — ask which company this person belongs to, then use find_company. Pass "skip" for an individual with no company.',
@@ -581,8 +591,8 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       phone: z.string().max(50).optional(),
     },
     guard(async (a: any) => {
-      const ownerId = val<string>(a.primary_owner_id) ?? actorUid(env);
-      const rows = await asUser(env, (sql) => sql`
+      const ownerId = val<string>(a.primary_owner_id) ?? actor.uid;
+      const rows = await asUser(actor, (sql) => sql`
         WITH new_contact AS (
           INSERT INTO contacts (full_name, email, phone, company_id, status, primary_owner_id)
           VALUES (
@@ -636,8 +646,8 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       source: askOrSkip(z.string().max(200), 'no source is recorded').describe(
         'REQUIRED — ask the user where the lead came from, e.g. LinkedIn or Upwork. NEVER invent or infer it. Pass "skip" if they do not know.',
       ),
-      primary_owner_id: askOrSkip(z.string().uuid(), 'the MCP system account owns it').describe(
-        'REQUIRED — ask the user who owns this deal, then use find_user. Pass "skip" for none.',
+      primary_owner_id: askOrSkip(z.string().uuid(), 'you, the signed-in user, become the owner').describe(
+        'REQUIRED — ask the user who owns this deal, then use find_user. Pass "skip" for none; skipping makes you, the signed-in user, the owner.',
       ),
       close_date: askOrSkip(z.string(), 'no closing date is set').describe(
         'REQUIRED — ask the user for the expected closing date (YYYY-MM-DD). Pass "skip" for none.',
@@ -648,7 +658,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       // Resolve the stage: the caller's choice if it belongs to this pipeline,
       // else the pipeline's first live stage.
       const wanted = a.stage_id ?? null;
-      const stageRows = await asUser<{ id: string }>(env, (sql) => sql`
+      const stageRows = await asUser<{ id: string }>(actor, (sql) => sql`
         SELECT id FROM pipeline_stages
         WHERE pipeline_id = ${a.pipeline_id}::uuid AND archived_at IS NULL
           AND (${wanted}::uuid IS NULL OR id = ${wanted}::uuid)
@@ -665,8 +675,8 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
         throw new Error('That pipeline has no stages. Add a stage before placing deals in it.');
       }
 
-      const ownerId = val<string>(a.primary_owner_id) ?? actorUid(env);
-      const rows = await asUser(env, (sql) => sql`
+      const ownerId = val<string>(a.primary_owner_id) ?? actor.uid;
+      const rows = await asUser(actor, (sql) => sql`
         WITH new_deal AS (
           INSERT INTO deals (
             name, contact_id, payment_type, deal_value, initial_deal_amount,
@@ -748,11 +758,11 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       // Normalise the app names to the catalog's canonical casing. Unlike the OS
       // UI, which silently drops unknown entries, we REJECT them and list what is
       // valid — a silent drop would lose data the caller thought it had set.
-      const apps = await normaliseApps(env, Array.isArray(a.apps) ? a.apps : []);
+      const apps = await normaliseApps(actor, Array.isArray(a.apps) ? a.apps : []);
       const dealId = val<string>(a.deal_id);
       const contactId = val<string>(a.contact_id);
 
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         INSERT INTO projects (
           name, deal_id, contact_id, status, start_date,
           estimated_completion_date, estimated_hours, project_manager_id, apps_used
@@ -904,7 +914,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
       // tasks SELECT policy (fn_can_see) is self-referential, so the new row is
       // invisible to RETURNING and the insert is rejected even for an admin.
-      const rows = await asUserMany(env, (sql) => [
+      const rows = await asUserMany(actor, (sql) => [
         sql`
           INSERT INTO tasks (
             id, title, parent_type, parent_id, status, priority, start_date, plan_due_date,
@@ -993,7 +1003,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       const milestoneId = crypto.randomUUID();
       // Same self-referential SELECT policy problem as tasks: insert without
       // RETURNING, then read the row back in the same transaction.
-      const rows = await asUserMany(env, (sql) => [
+      const rows = await asUserMany(actor, (sql) => [
         sql`
           INSERT INTO milestones (
             id, name, project_id, status, target_date,
@@ -1034,7 +1044,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     },
     guard(async (a: any) => {
       if (a.entity === 'deal') {
-        const stages = await asUser(env, (sql) => sql`
+        const stages = await asUser(actor, (sql) => sql`
           SELECT p.id AS pipeline_id, p.name AS pipeline_name,
                  s.id AS stage_id, s.name AS stage_name, s.sort_order
           FROM pipelines p
@@ -1053,7 +1063,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
         payment: 'payment_status',
       }[a.entity as 'contact' | 'project' | 'milestone' | 'task' | 'payment'];
 
-      const rows = await asUser<{ value: string }>(env, (sql) => sql`
+      const rows = await asUser<{ value: string }>(actor, (sql) => sql`
         SELECT e.enumlabel AS value
         FROM pg_enum e
         JOIN pg_type t ON t.oid = e.enumtypid
@@ -1097,7 +1107,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       const search = a.search ? `%${a.search}%` : null;
       const limit = a.limit ?? 100;
 
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT p.*,
                -- Dates as raw text: the Neon driver otherwise parses them to a JS
                -- Date at UTC midnight, which renders a day early in IST.
@@ -1191,7 +1201,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
         }
       }
 
-      const rows = await asUserMany(env, (sql) => [
+      const rows = await asUserMany(actor, (sql) => [
         sql`
           INSERT INTO payments (
             id, deal_id, project_id, milestone_id,
@@ -1219,7 +1229,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
             ${a.hours_logged ?? null},
             ${a.hourly_rate ?? null},
             ${a.invoice_no ?? null},
-            ${actorUid(env)}::uuid
+            ${actor.uid}::uuid
           )
         `,
         ...developers.map(
@@ -1261,7 +1271,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
         working_hours: string | null;
         status: string | null;
         allocations: { project_id: string; project_name: string; hours: number }[] | null;
-      }>(env, (sql) => sql`
+      }>(actor, (sql) => sql`
         SELECT
           u.id                                        AS user_id,
           COALESCE(u.full_name, u.email, u.id::text)  AS user_name,
@@ -1368,7 +1378,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       }
       // Per column: clear wins, else the new value, else keep what's there.
       // Column names are hard-coded literals; every value is parameterised.
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE contacts SET
           full_name  = COALESCE(${a.full_name ?? null}, full_name),
           email      = CASE WHEN 'email'      = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.email ?? null}, email) END,
@@ -1418,7 +1428,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       if (given.length === 0 && clear.length === 0) {
         throw new Error('Pass at least one field to change or clear.');
       }
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE deals SET
           name                = COALESCE(${a.name ?? null}, name),
           deal_value          = CASE WHEN 'deal_value'          = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.deal_value ?? null}, deal_value) END,
@@ -1466,8 +1476,8 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
         throw new Error('Pass at least one field to change or clear.');
       }
       // apps replaces wholesale when supplied; null leaves the column alone.
-      const apps = a.apps === undefined ? null : await normaliseApps(env, a.apps);
-      const rows = await asUser(env, (sql) => sql`
+      const apps = a.apps === undefined ? null : await normaliseApps(actor, a.apps);
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE projects SET
           name                      = COALESCE(${a.name ?? null}, name),
           apps_used                 = COALESCE(${apps}::text[], apps_used),
@@ -1515,7 +1525,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       if (given.length === 0 && clear.length === 0) {
         throw new Error('Pass at least one field to change or clear.');
       }
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE milestones SET
           name                   = COALESCE(${a.name ?? null}, name),
           status                 = COALESCE(${a.status ?? null}::milestone_status, status),
@@ -1566,7 +1576,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       if (given.length === 0 && clear.length === 0) {
         throw new Error('Pass at least one field to change or clear.');
       }
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE tasks SET
           title                = COALESCE(${a.title ?? null}, title),
           priority             = COALESCE(${a.priority ?? null}::priority, priority),
@@ -1625,7 +1635,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       if (given.length === 0 && clear.length === 0) {
         throw new Error('Pass at least one field to change or clear.');
       }
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE payments SET
           amount              = COALESCE(${a.amount ?? null}, amount),
           currency            = COALESCE(${a.currency ?? null}, currency),
@@ -1666,7 +1676,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       status: z.string().min(1),
     },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE tasks
            SET status = ${a.status}::task_status, updated_at = now()
          WHERE id = ${a.task_id}::uuid AND archived_at IS NULL
@@ -1690,7 +1700,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       if (a.status === 'on_hold' && reason === '') {
         throw new Error('A reason is required to put a project on hold.');
       }
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE projects
            SET status = ${a.status}::project_status,
                on_hold_reason = ${a.status === 'on_hold' ? reason : null},
@@ -1716,7 +1726,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       // real gate; this is the clean message.
       if (a.status === 'received') {
         const rows = await asUser<{ amount: string | null; received_amount_inr: string | null }>(
-          env,
+          actor,
           (sql) => sql`
             SELECT amount, received_amount_inr FROM payments
             WHERE id = ${a.payment_id}::uuid AND archived_at IS NULL
@@ -1729,7 +1739,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
           );
         }
       }
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE payments
            SET status = ${a.status}::payment_status, updated_at = now()
          WHERE id = ${a.payment_id}::uuid AND archived_at IS NULL
@@ -1748,7 +1758,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       stage_id: z.string().uuid(),
     },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         UPDATE deals d
            SET stage_id = ${a.stage_id}::uuid,
                -- Keep the legacy deal_stage enum in sync when the stage's NAME is
@@ -1816,7 +1826,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       const statuses = a.status?.length ? a.status : null;
       const full = a.full === true;
       const search = a.search ? `%${a.search}%` : null;
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT t.id, t.display_id, t.title,
                t.status::text AS status, t.priority::text AS priority,
                t.start_date::text AS start_date,
@@ -1899,7 +1909,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       let rows: Record<string, unknown>[];
       switch (a.entity) {
         case 'company':
-          rows = await asUser(env, (sql) => sql`
+          rows = await asUser(actor, (sql) => sql`
             SELECT c.*, u.full_name AS account_owner_name,
                    (SELECT count(*)::int FROM contacts ct
                      WHERE ct.company_id = c.id AND ct.archived_at IS NULL) AS contact_count
@@ -1907,13 +1917,13 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
             WHERE c.id = ${id}::uuid`);
           break;
         case 'contact':
-          rows = await asUser(env, (sql) => sql`
+          rows = await asUser(actor, (sql) => sql`
             SELECT c.*, co.name AS company_name
             FROM contacts c LEFT JOIN companies co ON co.id = c.company_id
             WHERE c.id = ${id}::uuid`);
           break;
         case 'deal':
-          rows = await asUser(env, (sql) => sql`
+          rows = await asUser(actor, (sql) => sql`
             SELECT d.*, to_char(d.close_date, 'YYYY-MM-DD') AS close_date,
                    c.full_name AS contact_name, pl.name AS pipeline_name, ps.name AS stage_name
             FROM deals d
@@ -1923,7 +1933,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
             WHERE d.id = ${id}::uuid`);
           break;
         case 'project':
-          rows = await asUser(env, (sql) => sql`
+          rows = await asUser(actor, (sql) => sql`
             SELECT p.*,
                    to_char(p.start_date, 'YYYY-MM-DD')                AS start_date,
                    to_char(p.estimated_completion_date, 'YYYY-MM-DD') AS estimated_completion_date,
@@ -1935,7 +1945,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
             WHERE p.id = ${id}::uuid`);
           break;
         case 'milestone':
-          rows = await asUser(env, (sql) => sql`
+          rows = await asUser(actor, (sql) => sql`
             SELECT m.*,
                    to_char(m.start_date, 'YYYY-MM-DD')             AS start_date,
                    to_char(m.target_date, 'YYYY-MM-DD')            AS target_date,
@@ -1948,7 +1958,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
           // t.* already carried created_by; what was missing is the creator's
           // NAME and the assignee/manager relations. A single task fetch is now
           // the complete feed, with no follow-up calls needed.
-          rows = await asUser(env, (sql) => sql`
+          rows = await asUser(actor, (sql) => sql`
             SELECT t.*,
                    to_char(t.start_date, 'YYYY-MM-DD')           AS start_date,
                    to_char(t.plan_due_date, 'YYYY-MM-DD')        AS plan_due_date,
@@ -1976,7 +1986,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
             WHERE t.id = ${id}::uuid`);
           break;
         default:
-          rows = await asUser(env, (sql) => sql`
+          rows = await asUser(actor, (sql) => sql`
             SELECT p.*,
                    to_char(p.billing_date, 'YYYY-MM-DD') AS billing_date,
                    to_char(p.payment_date, 'YYYY-MM-DD') AS payment_date,
@@ -2009,43 +2019,43 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       let rows: Record<string, unknown>[];
       switch (a.entity) {
         case 'company':
-          rows = await asUserWithReason(env, why, (sql) => sql`
+          rows = await asUserWithReason(actor, why, (sql) => sql`
             UPDATE companies SET archived_at = now(), updated_at = now()
             WHERE id = ${id}::uuid AND archived_at IS NULL
             RETURNING id, display_id, archived_at`);
           break;
         case 'contact':
-          rows = await asUserWithReason(env, why, (sql) => sql`
+          rows = await asUserWithReason(actor, why, (sql) => sql`
             UPDATE contacts SET archived_at = now(), updated_at = now()
             WHERE id = ${id}::uuid AND archived_at IS NULL
             RETURNING id, display_id, archived_at`);
           break;
         case 'deal':
-          rows = await asUserWithReason(env, why, (sql) => sql`
+          rows = await asUserWithReason(actor, why, (sql) => sql`
             UPDATE deals SET archived_at = now(), updated_at = now()
             WHERE id = ${id}::uuid AND archived_at IS NULL
             RETURNING id, display_id, archived_at`);
           break;
         case 'project':
-          rows = await asUserWithReason(env, why, (sql) => sql`
+          rows = await asUserWithReason(actor, why, (sql) => sql`
             UPDATE projects SET archived_at = now(), updated_at = now()
             WHERE id = ${id}::uuid AND archived_at IS NULL
             RETURNING id, display_id, archived_at`);
           break;
         case 'milestone':
-          rows = await asUserWithReason(env, why, (sql) => sql`
+          rows = await asUserWithReason(actor, why, (sql) => sql`
             UPDATE milestones SET archived_at = now(), updated_at = now()
             WHERE id = ${id}::uuid AND archived_at IS NULL
             RETURNING id, display_id, archived_at`);
           break;
         case 'task':
-          rows = await asUserWithReason(env, why, (sql) => sql`
+          rows = await asUserWithReason(actor, why, (sql) => sql`
             UPDATE tasks SET archived_at = now(), updated_at = now()
             WHERE id = ${id}::uuid AND archived_at IS NULL
             RETURNING id, display_id, archived_at`);
           break;
         default:
-          rows = await asUserWithReason(env, why, (sql) => sql`
+          rows = await asUserWithReason(actor, why, (sql) => sql`
             UPDATE payments SET archived_at = now(), updated_at = now()
             WHERE id = ${id}::uuid AND archived_at IS NULL
             RETURNING id, display_id, archived_at`);
@@ -2066,7 +2076,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Assign a user to a task (who does the work). Idempotent.',
     { task_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         INSERT INTO task_assignees (task_id, user_id)
         VALUES (${a.task_id}::uuid, ${a.user_id}::uuid)
         ON CONFLICT (task_id, user_id) DO NOTHING
@@ -2080,7 +2090,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Unassign a user from a task.',
     { task_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         DELETE FROM task_assignees
         WHERE task_id = ${a.task_id}::uuid AND user_id = ${a.user_id}::uuid
         RETURNING id`);
@@ -2093,7 +2103,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Add a manager to a task (who oversees it). Idempotent.',
     { task_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         INSERT INTO task_managers (task_id, user_id)
         VALUES (${a.task_id}::uuid, ${a.user_id}::uuid)
         ON CONFLICT (task_id, user_id) DO NOTHING
@@ -2107,7 +2117,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Remove a manager from a task.',
     { task_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         DELETE FROM task_managers
         WHERE task_id = ${a.task_id}::uuid AND user_id = ${a.user_id}::uuid
         RETURNING id`);
@@ -2124,7 +2134,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       role: z.enum(['pm', 'developer']),
     },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         INSERT INTO project_members (project_id, user_id, role)
         VALUES (${a.project_id}::uuid, ${a.user_id}::uuid, ${a.role}::user_role)
         ON CONFLICT (project_id, user_id) DO NOTHING
@@ -2138,7 +2148,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Remove a user from a project team.',
     { project_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         DELETE FROM project_members
         WHERE project_id = ${a.project_id}::uuid AND user_id = ${a.user_id}::uuid
         RETURNING id`);
@@ -2151,7 +2161,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Set who owns a contact. Writes the authoritative contact_owners join row and updates the cached header pointer.',
     { contact_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
-      const rows = await asUserMany(env, (sql) => [
+      const rows = await asUserMany(actor, (sql) => [
         sql`
           INSERT INTO contact_owners (contact_id, user_id)
           VALUES (${a.contact_id}::uuid, ${a.user_id}::uuid)
@@ -2219,7 +2229,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
         }
         const bad = validateContent(bytes, mime);
         if (bad) throw new Error(`${bad} Nothing was stored.`);
-        await storeAttachment(env, {
+        await storeAttachment(actor, {
           id: attachmentId,
           parentType: a.parent_type,
           parentId: a.parent_id,
@@ -2238,7 +2248,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
         };
       }
 
-      const rows = await asUserMany(env, (sql) => [
+      const rows = await asUserMany(actor, (sql) => [
         sql`
           INSERT INTO attachments (
             id, parent_type, parent_id, kind, title, url,
@@ -2247,7 +2257,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
           VALUES (
             ${attachmentId}::uuid, ${a.parent_type}::entity_type, ${a.parent_id}::uuid,
             'link'::attachment_kind, ${a.title}, ${a.url}, ${a.mime_type ?? null},
-            NULL, ${a.purpose ?? null}, ${actorUid(env)}::uuid
+            NULL, ${a.purpose ?? null}, ${actor.uid}::uuid
           )
         `,
         sql`SELECT id FROM attachments WHERE id = ${attachmentId}::uuid`,
@@ -2291,13 +2301,14 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     guard(async (a: any) => {
       // Fail now, not after the sandbox has already sent the bytes: the record
       // must exist and be editable by the acting user.
-      const visible = await asUser(env, (sql) => sql`
+      const visible = await asUser(actor, (sql) => sql`
         SELECT 1 AS ok WHERE fn_can_edit(${a.parent_type}::entity_type, ${a.parent_id}::uuid)
       `);
       if (visible.length === 0) {
         throw new Error('Not permitted to attach to that record, or the record does not exist.');
       }
       const claims = await newUploadClaims({
+        u: actor.uid,
         pt: a.parent_type,
         pid: a.parent_id,
         title: a.file_name,
@@ -2327,7 +2338,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'Step 2 of 2. Confirms an upload from start_attachment_upload: re-reads the stored file and checks it is complete (size matches, content valid). Returns the attached file, or says plainly that it failed.',
     { attachment_id: z.string().uuid() },
     guard(async (a: any) => {
-      const r = await verifyStored(env, a.attachment_id);
+      const r = await verifyStored(actor, a.attachment_id);
       if (!r.ok) {
         throw new Error(
           `Attachment ${a.attachment_id} is NOT usable: ${r.reason} Tell the user it failed; do not report success.`,
@@ -2347,7 +2358,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     guard(async (a: any) =>
       // Deliberately does NOT return data_base64 — file contents are fetched
       // one at a time in the app, never dumped into a list response.
-      asUser(env, (sql) => sql`
+      asUser(actor, (sql) => sql`
         SELECT at.id, at.kind::text AS kind, at.title, at.url, at.mime_type,
                at.size_bytes, at.purpose, at.created_at,
                u.full_name AS uploaded_by_name
@@ -2375,8 +2386,13 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
   // that person and the comment appears under their name, exactly like one
   // typed in the app. That is why the author is limited to TASK_CREATORS and
   // must be backed by the user's own words — the same checks as create_task.
-  // Only this one statement runs as them; every other tool stays on the MCP
-  // service account.
+  // Only this one statement runs as them; every other tool runs as the
+  // signed-in caller.
+  //
+  // TODO(phase 2b) — ROLLOUT BLOCKER: with per-user sign-in, ANY signed-in user
+  // can still post as Faizal Khan or Manish Mandot, and the insert runs with
+  // THAT person's permissions. Before real users get access, post as the
+  // signed-in caller (actor) instead, and retire author_id/author_quote here.
   // =========================================================================
   server.tool(
     'add_task_comment',
@@ -2458,12 +2474,12 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       limit: num(z.number().int().min(1).max(500).default(100)),
     },
     guard(async (a: any) => {
-      const tasks = await asUser<{ id: string; display_id: string; title: string }>(env, (sql) => sql`
+      const tasks = await asUser<{ id: string; display_id: string; title: string }>(actor, (sql) => sql`
         SELECT id, display_id, title FROM tasks WHERE id = ${a.task_id}::uuid
       `);
       // Not-found and RLS-denied are deliberately indistinguishable.
       if (tasks.length === 0) throw new Error('Task not found or not visible.');
-      const comments = await asUser(env, (sql) => sql`
+      const comments = await asUser(actor, (sql) => sql`
         SELECT * FROM (
           SELECT ce.id, ce.body, ce.occurred_at,
                  ce.channel::text AS channel, ce.direction::text AS direction,
@@ -2506,7 +2522,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       parent_id: z.string().uuid(),
     },
     guard(async (a: any) => {
-      const rows = await asUser(env, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         SELECT c.id, c.label, c.login_url, c.username,
                c.two_factor_enabled, c.two_factor_destination,
                c.we_have_account_access, c.our_access_account,
@@ -2542,7 +2558,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'List sales pipelines with their stages. Needed before create_deal.',
     {},
     guard(async () =>
-      asUser(env, (sql) => sql`
+      asUser(actor, (sql) => sql`
         SELECT p.id AS pipeline_id, p.name AS pipeline_name,
                s.id AS stage_id, s.name AS stage_name, s.sort_order
         FROM pipelines p
@@ -2558,7 +2574,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     'The controlled vocabulary of apps/tools a project can be tagged with. Call before create_project so you offer the user real options.',
     {},
     guard(async () =>
-      asUser(env, (sql) => sql`
+      asUser(actor, (sql) => sql`
         SELECT id, name FROM project_app_catalog
         WHERE archived_at IS NULL ORDER BY name
       `),
@@ -2578,7 +2594,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
       // NOTE the doubled backslash: '\\D' in TS produces the SQL literal '\D'.
       const digits = String(a.query).replace(/\D/g, '');
       const phone = digits.length >= 7 ? digits : null;
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT c.id, c.display_id, c.full_name, c.email, c.phone,
                c.status::text AS status, co.name AS company_name
         FROM contacts c
@@ -2613,7 +2629,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     guard(async (a: any) => {
       const q = a.query ? `%${a.query}%` : null;
       const role = a.role ?? null;
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT u.id, u.display_id, u.full_name, u.email,
                u.role::text AS role, u.status::text AS status
         FROM users u
@@ -2641,7 +2657,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT d.id, d.display_id, d.name, d.stage::text AS stage,
                d.deal_value, d.currency, d.pipeline_id, d.stage_id,
                c.id AS contact_id, c.full_name AS contact_name
@@ -2664,7 +2680,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT p.id, p.display_id, p.name, p.status::text AS status,
                p.start_date::text AS start_date, p.deal_id,
                c.full_name AS client_name
@@ -2689,7 +2705,7 @@ export function registerTools(server: ToolServer, env: Env, origin = ''): void {
     guard(async (a: any) => {
       const q = a.query ? `%${a.query}%` : null;
       const projectId = a.project_id ?? null;
-      return asUser(env, (sql) => sql`
+      return asUser(actor, (sql) => sql`
         SELECT m.id, m.display_id, m.name, m.status::text AS status,
                m.project_id, p.name AS project_name
         FROM milestones m

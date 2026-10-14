@@ -9,7 +9,7 @@
 // whichever route is used, a cut-off, empty or mislabelled file is REFUSED
 // instead of being stored as a "successful" attachment.
 
-import { asUser, asUserMany, actorUid, type Env } from './db';
+import { asUser, asUserMany, type Actor, type Env } from './db';
 
 /** Largest file accepted. Raise deliberately: the OS app serves these from Postgres. */
 export const MAX_FILE_BYTES = 5 * 1024 * 1024;
@@ -123,12 +123,14 @@ export function toBase64(bytes: Uint8Array): string {
 }
 
 // ---------------------------------------------------------------------------
-// Signed upload URLs (stateless: HMAC over the claims, keyed by MCP_AUTH_TOKEN)
+// Signed upload URLs (stateless: HMAC over the claims, keyed by UPLOAD_SIGNING_KEY)
 // ---------------------------------------------------------------------------
 
 export type UploadClaims = {
   /** attachment id — also makes the URL single-use (primary-key conflict on reuse) */
   a: string;
+  /** uploader: the signed-in OS user (users.id). The upload's DB writes run as them. */
+  u: string;
   pt: string;
   pid: string;
   title: string;
@@ -147,9 +149,11 @@ const fromB64url = (s: string) =>
   decodeBase64Strict(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4));
 
 async function hmac(env: Env, message: string): Promise<Uint8Array> {
+  // Fail closed: an empty key would make every link forgeable.
+  if (!env.UPLOAD_SIGNING_KEY) throw new Error('UPLOAD_SIGNING_KEY is not configured.');
   const key = await crypto.subtle.importKey(
     'raw',
-    enc.encode(`os-mcp-upload:${env.MCP_AUTH_TOKEN}`),
+    enc.encode(`user-os-mcp-upload:${env.UPLOAD_SIGNING_KEY}`),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
@@ -174,6 +178,7 @@ export async function verifyUpload(env: Env, token: string): Promise<UploadClaim
   if (!claims.exp || Date.now() / 1000 > claims.exp) {
     throw new Error('This upload link has expired. Call start_attachment_upload again.');
   }
+  if (typeof claims.u !== 'string' || claims.u === '') throw new Error('Invalid upload token.');
   return claims;
 }
 
@@ -193,7 +198,7 @@ export async function newUploadClaims(
 // ---------------------------------------------------------------------------
 
 export async function storeAttachment(
-  env: Env,
+  actor: Actor,
   p: {
     id: string;
     parentType: string;
@@ -208,7 +213,7 @@ export async function storeAttachment(
   // TWO statements, one transaction: the blob's INSERT policy does
   // EXISTS (SELECT 1 FROM attachments …), which cannot see a row inserted by the
   // SAME statement. The final SELECT proves RLS let the whole thing through.
-  const rows = await asUserMany(env, (sql) => [
+  const rows = await asUserMany(actor, (sql) => [
     sql`
       INSERT INTO attachments (
         id, parent_type, parent_id, kind, title, url, mime_type, size_bytes, purpose, uploaded_by
@@ -216,7 +221,7 @@ export async function storeAttachment(
       VALUES (
         ${p.id}::uuid, ${p.parentType}::entity_type, ${p.parentId}::uuid, 'file'::attachment_kind,
         ${p.title}, ${`/api/attachments/${p.id}`}, ${p.mime}, ${p.bytes.length},
-        ${p.purpose}, ${actorUid(env)}::uuid
+        ${p.purpose}, ${actor.uid}::uuid
       )
     `,
     sql`
@@ -234,11 +239,11 @@ export async function storeAttachment(
  * Read an attachment back and prove it is whole: the stored bytes decode, match
  * size_bytes, and pass the same content check. Used by finalize_attachment_upload.
  */
-export async function verifyStored(env: Env, id: string) {
+export async function verifyStored(actor: Actor, id: string) {
   const rows = await asUser<{
     id: string; title: string; mime_type: string | null; size_bytes: string | null;
     parent_type: string; parent_id: string; url: string; data_base64: string | null;
-  }>(env, (sql) => sql`
+  }>(actor, (sql) => sql`
     SELECT a.id, a.title, a.mime_type, a.size_bytes, a.parent_type::text AS parent_type,
            a.parent_id, a.url, b.data_base64
     FROM attachments a
