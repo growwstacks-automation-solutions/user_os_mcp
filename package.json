@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "perms:check": "esbuild scripts/perms-check.ts --bundle --platform=node --format=esm --outfile=.wrangler/perms-check.mjs --log-level=warning && node .wrangler/perms-check.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
@@ -16,6 +17,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260908.1",
+    "esbuild": "^0.28.1",
     "typescript": "^5.7.3",
     "wrangler": "^4.97.0"
   },

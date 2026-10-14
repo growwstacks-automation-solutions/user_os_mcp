@@ -14,7 +14,8 @@
 
 import { z } from 'zod';
 import type { Identity } from './auth';
-import { asUser, asUserMany, asUserWithReason, asNamedUser, type Actor, type Env } from './db';
+import { asUser, asUserMany, asUserWithReason, type Actor, type Env } from './db';
+import { isToolAllowed, rulesFor } from './permissions';
 import {
   ALLOWED_MIME,
   MAX_FILE_BYTES,
@@ -96,93 +97,6 @@ const MILESTONE_STATUS = z.enum([
 ]);
 
 const PRIORITY = z.enum(['low', 'medium', 'high']);
-
-// ---------------------------------------------------------------------------
-// PERMITTED TASK CREATORS
-//
-// Only these people may be recorded as created_by. Enforced as a z.enum rather
-// than a describe() note for two reasons:
-//   1. The server REJECTS anything else, so a wrong creator cannot be written
-//      whatever the model decides to send.
-//   2. The JSON Schema then advertises exactly these ids, so the model sees a
-//      closed two-way choice instead of a free uuid field it can fill from
-//      whatever name happens to be lying around in its context.
-//
-// To add someone: add a line here and redeploy. Kept deliberately small - this
-// is an attribution allowlist, not a permission system (RLS still does that).
-// ---------------------------------------------------------------------------
-const TASK_CREATORS: Record<string, string> = {
-  'Faizal Khan': '00b5232b-2f84-4b7e-ae98-26ccf683e7c5',
-  'Manish Mandot': '4e0d5b3b-fe89-485b-be6a-5909cf272d5c',
-};
-
-const CREATOR_IDS = Object.values(TASK_CREATORS) as [string, ...string[]];
-
-/**
- * The "the user did not tell me" sentinel.
- *
- * A description cannot make a model stop and ask a question - four deployed
- * attempts confirmed that; it just fills the field with whatever name is nearest.
- * What a model DOES do reliably is report a fact when asked one directly, and
- * relay a tool error back to the user. So the field asks a factual question -
- * did the user name a creator in THIS request? - and the server refuses this
- * value with the exact question to put to them. There is no path to a successful
- * create that does not name a real person.
- */
-const CREATOR_NOT_STATED = 'not_stated_by_user';
-
-const CREATOR_CHOICES = [...CREATOR_IDS, CREATOR_NOT_STATED] as [string, ...string[]];
-
-/** What creator_quote must say when the user named nobody. */
-const CREATOR_QUOTE_NONE = 'none';
-
-/** The question the server hands back whenever a creator cannot be established. */
-const CREATOR_QUESTION =
-  'ASK THE USER this question before trying again: "Who should I record as the creator of '
-  + `this task \u2014 ${Object.keys(TASK_CREATORS).join(' or ')}?" `
-  + 'Only those people may be recorded. When the user answers, call create_task again, '
-  + 'putting their answer in creator_quote. Do not choose on their behalf, and do not retry '
-  + 'with the same values.';
-
-/** The same question for a Discussion comment (add_task_comment). */
-const COMMENT_AUTHOR_QUESTION =
-  'ASK THE USER this question before trying again: "Who should this comment be posted as — '
-  + `${Object.keys(TASK_CREATORS).join(' or ')}?" `
-  + 'Only those people may post. When the user answers, call add_task_comment again, putting '
-  + 'their answer in author_quote. Do not choose on their behalf, and do not retry with the '
-  + 'same values.';
-
-/**
- * Remove the phrases that name an ASSIGNEE or a MANAGER.
- *
- * Checking only that the quoted text contains the name is not enough: on a task
- * whose assignee or manager happens to be a permitted creator, "assigned to
- * Faizal Khan" would satisfy a creator check and silently mis-attribute the row.
- * Each phrase is cut at the next comma, full stop or semicolon, so a mixed
- * sentence such as "assigned to Faizal Khan, created by Manish Mandot" keeps the
- * creator clause and loses only the assignee one.
- */
-function withoutRoleMentions(text: string): string {
-  return text.replace(
-    /\b(assigned to|assignee'?s?(?:\s+(?:is|are))?|assign(?:ing|ed)? to|managed by|manager'?s?(?:\s+(?:is|are))?|project manager(?:\s+is)?|pm(?:\s+is)?|owned by|owner(?:\s+is)?|reviewer(?:\s+is)?)\b[^,.;]*/gi,
-    ' ',
-  );
-}
-
-/** The permitted creator whose first name appears in `text`, if any. */
-function creatorNamedIn(text: string): string | null {
-  const haystack = text.toLowerCase();
-  for (const name of Object.keys(TASK_CREATORS)) {
-    const first = name.split(' ')[0].toLowerCase();
-    if (haystack.includes(first) || haystack.includes(name.toLowerCase())) return name;
-  }
-  return null;
-}
-
-/** "Faizal Khan = <id>; Manish Mandot = <id>" - inlined into the description. */
-const CREATOR_HINT = Object.entries(TASK_CREATORS)
-  .map(([name, id]) => `${name} = ${id}`)
-  .join('; ');
 
 // ---------------------------------------------------------------------------
 // ASK-OR-SKIP
@@ -391,13 +305,38 @@ function changedFields(a: Record<string, unknown>, idKey: string): string[] {
 }
 
 export function registerTools(
-  server: ToolServer,
+  mcpServer: ToolServer,
   env: Env,
   origin: string,
   identity: Identity,
 ): void {
   // Every query below runs as the signed-in OS user, so RLS applies THEIR permissions.
   const actor: Actor = { env, uid: identity.id };
+  const role = identity.role;
+
+  // ROLE GATE (permissions.ts). Every tool below is declared through this
+  // wrapper: a tool the role may not use is never registered, so tools/list only
+  // shows what the caller can use. The handler is ALSO wrapped so the role is
+  // re-checked on every call (defence in depth), before any argument handling.
+  const server: ToolServer = {
+    tool: (name, description, schema, handler) => {
+      if (!isToolAllowed(role, name)) return;
+      mcpServer.tool(name, description, schema, async (args) =>
+        isToolAllowed(role, name)
+          ? handler(args)
+          : fail(`Your role (${role}) is not allowed to use ${name}.`),
+      );
+    },
+  };
+
+  /** Refuse unless the caller is an assignee of the task (read as the caller). */
+  async function assertAssignee(taskId: string): Promise<void> {
+    const rows = await asUser(actor, (sql) => sql`
+      SELECT 1 AS ok FROM task_assignees
+      WHERE task_id = ${taskId}::uuid AND user_id = ${actor.uid}::uuid
+    `);
+    if (rows.length === 0) throw new Error('You can only change tasks you are assigned to.');
+  }
 
   // =========================================================================
   // 0. COMPANIES — the ACCOUNT. A contact is a person; a company is the
@@ -798,7 +737,7 @@ export function registerTools(
   // =========================================================================
   server.tool(
     'create_task',
-    'Create a task under a milestone (or a deal/payment). ASK THE USER for priority, project manager, assignee, start date, due date, estimated hours AND who is creating the task if any are missing — never guess them.',
+    'Create a task under a milestone (or a deal/payment). ASK THE USER for priority, project manager, assignee, start date, due date and estimated hours if any are missing — never guess them. The task is recorded as created by you, the signed-in user.',
     {
       title: z.string().min(1).max(300),
       parent_id: z.string().uuid().describe('Usually a milestone id — see find_milestone.'),
@@ -835,36 +774,6 @@ export function registerTools(
       start_date: askOrSkip(z.string(), 'no start date is set').describe(
         'REQUIRED — ask the user for the start date (YYYY-MM-DD). Pass "skip" for none.',
       ),
-      // Attribution only. The MCP authenticates with ONE shared token and acts
-      // under ONE identity (GS_ACTOR_UID), so the database cannot know which
-      // human is calling — it has to be told.
-      //
-      // ask-or-skip, NOT optional: an optional field lets the model quietly omit
-      // it, which is the silent defaulting this file exists to prevent. Every task
-      // was landing on the MCP service account because nobody was ever asked.
-      // Required-but-skippable forces a conscious choice on every create.
-      //
-      // Attribution ONLY: this sets created_by and never touches
-      // app.current_user_id, so RLS authorizes the call exactly as before.
-      // Three values: the two permitted people, plus an explicit "the user did not
-      // say" sentinel that the SERVER rejects with the question to ask. The sentinel
-      // is NOT an escape hatch like the old "skip" - it cannot produce a task. It
-      // exists so the model has an honest answer available other than guessing.
-      acting_user_id: z.enum(CREATOR_CHOICES).describe(
-        `REQUIRED — who is creating this task. The ONLY permitted creators are: ${CREATOR_HINT}. Pass one of those two ids if and ONLY IF the user named the creator in THIS request. In EVERY other case you MUST pass "${CREATOR_NOT_STATED}" — that includes when they said nothing about a creator, when they named anybody else, and when you would be taking it from an earlier message, another task, the assignee or the manager. Passing "${CREATOR_NOT_STATED}" returns an error containing the question to put to the user; that is the intended flow, not a failure. There is no default and no system-account fallback. Never guess who the creator is.`,
-      ),
-      // EVIDENCE for acting_user_id. Saying "ask the user" in a description does not make a
-      // model ask - it fills the field and moves on, and a server cannot tell a stated name
-      // from an invented one when both arrive as the same id. Quoting can be checked: the
-      // server verifies this text actually contains the name that was selected, so the only
-      // way to record a creator the user never mentioned is to fabricate their words.
-      creator_quote: z
-        .string()
-        .min(1)
-        .max(500)
-        .describe(
-          `REQUIRED — copy, VERBATIM, the words from the user request that name the task creator (for example "created by Faizal Khan"). Pass "${CREATOR_QUOTE_NONE}" if the user did not name a creator anywhere in their request. Never paraphrase, never invent, and never quote from an earlier message or another task. The server checks that this text contains the name chosen in acting_user_id and refuses the call if it does not.`,
-        ),
     },
     guard(async (a: any) => {
       const taskId = crypto.randomUUID();
@@ -876,40 +785,9 @@ export function registerTools(
       const dueDate = val<string>(a.plan_due_date);
       const estHours = val<number>(a.estimated_hours);
       const requirement = val<string>(a.requirement);
-      // Attribution: the named human when the caller supplied one, otherwise the
-      // service identity exactly as before.
-      // ------------------------------------------------------------------
-      // CREATOR: the id must be backed by the user's own words.
-      // Nothing is written on any failure path below, so a refusal never
-      // leaves a half-made task or a wrongly attributed one.
-      // ------------------------------------------------------------------
-      const quote = String(a.creator_quote ?? '').trim();
-      const quotedNobody = quote.toLowerCase() === CREATOR_QUOTE_NONE;
-
-      // The model has told us outright that the user named no creator.
-      if (a.acting_user_id === CREATOR_NOT_STATED || quotedNobody) {
-        throw new Error(`The creator of this task has not been specified. ${CREATOR_QUESTION}`);
-      }
-
-      const chosenName = Object.keys(TASK_CREATORS).find(
-        (name) => TASK_CREATORS[name] === a.acting_user_id,
-      );
-
-      // The quoted words must name the selected person AS THE CREATOR. Assignee and
-      // manager phrases are stripped first, so quoting "assigned to Faizal Khan"
-      // cannot stand in for a creator. This is the check that catches an inferred
-      // creator: in a request that never names one, no honest quote survives it.
-      const creatorEvidence = withoutRoleMentions(quote);
-      if (!chosenName || creatorNamedIn(creatorEvidence) !== chosenName) {
-        throw new Error(
-          `The creator you selected (${chosenName ?? 'unknown'}) is not named as the CREATOR in `
-          + `the text you quoted from the user: "${quote}". Naming somebody as the assignee or `
-          + `the manager does not make them the creator, and a creator must never be inferred `
-          + `from an earlier message or another task. ${CREATOR_QUESTION}`,
-        );
-      }
-
-      const createdBy = a.acting_user_id;
+      // Attribution: the signed-in user (resolved by auth.ts from their Clerk
+      // sign-in), never a name typed into the tool call.
+      const createdBy = actor.uid;
 
       // Insert WITHOUT RETURNING, then SELECT back in the same transaction: the
       // tasks SELECT policy (fn_can_see) is self-referential, so the new row is
@@ -1261,7 +1139,14 @@ export function registerTools(
       user_id: z.string().uuid().optional().describe('Limit to one developer.'),
     },
     guard(async (a: any) => {
-      const userId = a.user_id ?? null;
+      let userId = a.user_id ?? null;
+      // Role limit (permissions.ts): some roles only see their own availability.
+      if (rulesFor(role, 'get_developer_availability')?.selfOnly) {
+        if (userId !== null && userId !== actor.uid) {
+          throw new Error(`Your role (${role}) can only view your own availability. Leave user_id out.`);
+        }
+        userId = actor.uid;
+      }
       const rows = await asUser<{
         user_id: string;
         user_name: string;
@@ -1576,6 +1461,21 @@ export function registerTools(
       if (given.length === 0 && clear.length === 0) {
         throw new Error('Pass at least one field to change or clear.');
       }
+      // Role limit (permissions.ts): some roles may touch only a few fields, and
+      // only on tasks they are assigned to. Checked before anything is written.
+      const limit = rulesFor(role, 'update_task');
+      if (limit) {
+        const notAllowed = [...new Set([...given, ...clear])].filter(
+          (f) => !limit.allowedFields.includes(f),
+        );
+        if (notAllowed.length > 0) {
+          throw new Error(
+            `Your role (${role}) can only change: ${limit.allowedFields.join(', ')}. `
+            + `Not allowed: ${notAllowed.join(', ')}.`,
+          );
+        }
+        if (limit.assigneeOnly) await assertAssignee(a.task_id);
+      }
       const rows = await asUser(actor, (sql) => sql`
         UPDATE tasks SET
           title                = COALESCE(${a.title ?? null}, title),
@@ -1676,6 +1576,16 @@ export function registerTools(
       status: z.string().min(1),
     },
     guard(async (a: any) => {
+      // Role limit (permissions.ts): own tasks only, and optionally a status list.
+      const limit = rulesFor(role, 'set_task_status');
+      if (limit) {
+        if (limit.allowedStatuses && !limit.allowedStatuses.includes(a.status)) {
+          throw new Error(
+            `Your role (${role}) can only set these statuses: ${limit.allowedStatuses.join(', ')}.`,
+          );
+        }
+        if (limit.assigneeOnly) await assertAssignee(a.task_id);
+      }
       const rows = await asUser(actor, (sql) => sql`
         UPDATE tasks
            SET status = ${a.status}::task_status, updated_at = now()
@@ -2381,64 +2291,24 @@ export function registerTools(
   // MCP comments sit in the same thread as ones typed in the app.
   //
   // RLS (conversation_insert) only allows sender_user_id to be NULL or fn_me(),
-  // so unlike tasks.created_by the author cannot simply be written as a column
-  // value. Instead the insert runs AS the author (asNamedUser): fn_me() is then
-  // that person and the comment appears under their name, exactly like one
-  // typed in the app. That is why the author is limited to TASK_CREATORS and
-  // must be backed by the user's own words — the same checks as create_task.
-  // Only this one statement runs as them; every other tool runs as the
-  // signed-in caller.
-  //
-  // TODO(phase 2b) — ROLLOUT BLOCKER: with per-user sign-in, ANY signed-in user
-  // can still post as Faizal Khan or Manish Mandot, and the insert runs with
-  // THAT person's permissions. Before real users get access, post as the
-  // signed-in caller (actor) instead, and retire author_id/author_quote here.
+  // so the insert runs as the signed-in caller (actor) and the comment appears
+  // under THEIR name, exactly like one typed in the app.
   // =========================================================================
   server.tool(
     'add_task_comment',
-    `Post a comment to a task's Discussion thread, under the name of the person posting it. ASK THE USER who the comment should be posted as (${Object.keys(TASK_CREATORS).join(' or ')}) if they have not said in this request — never guess.`,
+    'Post a comment to a task\'s Discussion thread. It is posted under your own name, as the signed-in user.',
     {
       task_id: z.string().uuid().describe('Use list_tasks to find it.'),
       body: z.string().trim().min(1).max(20000).describe('The comment text, exactly as the user wants it posted.'),
-      author_id: z.enum(CREATOR_CHOICES).describe(
-        `REQUIRED — who the comment is posted as. The ONLY permitted authors are: ${CREATOR_HINT}. Pass one of those ids if and ONLY IF the user named who is posting in THIS request. In EVERY other case pass "${CREATOR_NOT_STATED}" — including when they named nobody, named anybody else, or you would be taking it from an earlier message or the task's assignee/manager. That returns an error with the question to ask the user; that is the intended flow. Never guess.`,
-      ),
-      author_quote: z
-        .string()
-        .min(1)
-        .max(500)
-        .describe(
-          `REQUIRED — copy, VERBATIM, the words from the user request that say who is posting (for example "post as Faizal" or "from Manish"). Pass "${CREATOR_QUOTE_NONE}" if they did not say. The server checks this text names the person chosen in author_id and refuses the call if it does not.`,
-        ),
     },
     guard(async (a: any) => {
-      const quote = String(a.author_quote ?? '').trim();
-      if (a.author_id === CREATOR_NOT_STATED || quote.toLowerCase() === CREATOR_QUOTE_NONE) {
-        throw new Error(`The author of this comment has not been specified. ${COMMENT_AUTHOR_QUESTION}`);
-      }
-      const chosenName = Object.keys(TASK_CREATORS).find(
-        (name) => TASK_CREATORS[name] === a.author_id,
-      );
-      // The quote must name the chosen person and ONLY them: "tell Manish the API
-      // is ready, from Faizal" names both, so it cannot settle who is posting.
-      const evidence = withoutRoleMentions(quote).toLowerCase();
-      const named = Object.keys(TASK_CREATORS).filter((name) =>
-        evidence.includes(name.split(' ')[0].toLowerCase()),
-      );
-      if (!chosenName || named.length !== 1 || named[0] !== chosenName) {
-        throw new Error(
-          `The author you selected (${chosenName ?? 'unknown'}) is not clearly named as the person `
-          + `posting in the text you quoted from the user: "${quote}". ${COMMENT_AUTHOR_QUESTION}`,
-        );
-      }
-
       const body = String(a.body).trim();
       // source=mcp keeps MCP-posted comments distinguishable in the data even
       // though they show under the author's name.
       const metadata = { source: 'mcp' };
       // fn_validate_parent rejects a missing/archived task; RLS rejects a task
-      // the author cannot see. Either way nothing is written.
-      const rows = await asNamedUser(env, a.author_id, (sql) => sql`
+      // the caller cannot see. Either way nothing is written.
+      const rows = await asUser(actor, (sql) => sql`
         WITH new_entry AS (
           INSERT INTO conversation_entries (
             parent_type, parent_id, channel, direction, sender_user_id, body, occurred_at, metadata

@@ -15,6 +15,7 @@
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
 
 import { asService, type Env } from './db';
+import { toolsForRole } from './permissions';
 
 export type Identity = {
   /** users.id — what app.current_user_id is set to for every query. */
@@ -174,5 +175,9 @@ async function osUserForEmail(env: Env, email: string): Promise<Identity> {
   }
   const u = rows[0];
   if (u.status === 'left_org') throw new AuthError(403, notFound);
+  // Deny by default: a role with no tools in permissions.ts cannot sign in at all.
+  if (toolsForRole(u.role).length === 0) {
+    throw new AuthError(403, `Your role (${u.role}) does not have MCP access yet. Contact an admin.`);
+  }
   return { id: u.id, role: u.role, email: u.email, name: u.full_name };
 }
