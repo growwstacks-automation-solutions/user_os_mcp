@@ -15,7 +15,17 @@
 import { z } from 'zod';
 import type { Identity } from './auth';
 import { asUser, asUserMany, asUserWithReason, type Actor, type Env } from './db';
-import { isToolAllowed, rulesFor } from './permissions';
+import {
+  NEVER_RETURN_FIELDS,
+  archiveAllowed,
+  can,
+  doneRule,
+  isToolAllowed,
+  recordAllowed,
+  rulesFor,
+  statusAllowed,
+  stripMoney,
+} from './permissions';
 import {
   ALLOWED_MIME,
   MAX_FILE_BYTES,
@@ -38,8 +48,13 @@ type ToolServer = {
   ) => void;
 };
 
+// Rating values and reviewer details never leave the server, for any role
+// (permissions.ts NEVER_RETURN_FIELDS): the keys are dropped from every result.
 const ok = (data: unknown) => ({
-  content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+  content: [{
+    type: 'text' as const,
+    text: JSON.stringify(data, (k, v) => (NEVER_RETURN_FIELDS.has(k) ? undefined : v), 2),
+  }],
 });
 
 const fail = (message: string) => ({
@@ -336,6 +351,58 @@ export function registerTools(
       WHERE task_id = ${taskId}::uuid AND user_id = ${actor.uid}::uuid
     `);
     if (rows.length === 0) throw new Error('You can only change tasks you are assigned to.');
+  }
+
+  /**
+   * M2 + M3: may the caller put a task into `status`? `taskId` is null for a
+   * new task, whose assignees (`newAssignees`) cannot have ratings yet.
+   * The rating check only computes yes/no here; no rating value is returned.
+   */
+  async function assertStatusAllowed(status: string, taskId: string | null, newAssignees: string[] = []) {
+    if (!statusAllowed(role, status)) {
+      throw new Error(
+        `Your role (${role}) can only set these statuses: ${rulesFor(role, 'taskStatuses')!.join(', ')}.`,
+      );
+    }
+    if (status !== 'done') return;
+    const rule = doneRule(role);
+    if (rule === 'always') return;
+    if (rule === 'never') throw new Error(`Your role (${role}) cannot mark a task as done.`);
+    // if_all_assignees_rated — the same test as trg_task_done_requires_rating.
+    if (taskId === null) {
+      if (newAssignees.length > 0) {
+        throw new Error('A task with assignees cannot be created as done: every assignee must be rated first.');
+      }
+      return;
+    }
+    const unrated = await asUser<{ full_name: string }>(actor, (sql) => sql`
+      SELECT u.full_name FROM task_assignees ta JOIN users u ON u.id = ta.user_id
+      WHERE ta.task_id = ${taskId}::uuid
+        AND NOT EXISTS (
+          SELECT 1 FROM work_ratings r
+          WHERE r.parent_type = 'task'::entity_type AND r.parent_id = ta.task_id
+            AND r.ratee_user_id = ta.user_id AND r.archived_at IS NULL
+        )
+    `);
+    if (unrated.length > 0) {
+      throw new Error(
+        `Rate every assignee before marking this task done. Not yet rated: ${unrated.map((u) => u.full_name).join(', ')}.`,
+      );
+    }
+  }
+
+  /** M6: only some roles may set or clear is_management. */
+  function assertManagementAllowed(value: unknown) {
+    if (value !== undefined && !can(role, 'setManagementTask')) {
+      throw new Error(`Your role (${role}) cannot set or change is_management.`);
+    }
+  }
+
+  /** M4: only some roles may mark a payment received. */
+  function assertReceivedAllowed(status: unknown) {
+    if (status === 'received' && !can(role, 'markPaymentReceived')) {
+      throw new Error('Only an admin or super admin can mark a payment as received.');
+    }
   }
 
   // =========================================================================
@@ -778,6 +845,9 @@ export function registerTools(
       start_date: askOrSkip(z.string(), 'no start date is set').describe(
         'REQUIRED — ask the user for the start date (YYYY-MM-DD). Pass "skip" for none.',
       ),
+      is_management: bool(z.boolean().optional()).describe(
+        'Management-stream task. Optional, defaults to false. Only admins can create one.',
+      ),
     },
     guard(async (a: any) => {
       const taskId = crypto.randomUUID();
@@ -789,6 +859,21 @@ export function registerTools(
       const dueDate = val<string>(a.plan_due_date);
       const estHours = val<number>(a.estimated_hours);
       const requirement = val<string>(a.requirement);
+      const isManagement = a.is_management === true;
+
+      // Role limits (permissions.ts), all checked before anything is written.
+      if (isManagement && !can(role, 'setManagementTask')) {
+        throw new Error(`Your role (${role}) cannot create a management task.`);
+      }
+      await assertStatusAllowed(status ?? 'todo', null, assigneeIds);
+      if (rulesFor(role, 'create_task')?.selfAssignOnly) {
+        const unique = [...new Set(assigneeIds)];
+        if (unique.length !== 1 || unique[0] !== actor.uid) {
+          throw new Error(
+            `Your role (${role}) can only create tasks assigned to yourself: assignee_ids must be exactly [your own user id].`,
+          );
+        }
+      }
       // Attribution: the signed-in user (resolved by auth.ts from their Clerk
       // sign-in), never a name typed into the tool call.
       const createdBy = actor.uid;
@@ -814,20 +899,23 @@ export function registerTools(
             ${estHours},
             ${requirement},
             ${managerIds[0] ?? null}::uuid,
-            false,
+            ${isManagement},
             ${createdBy}::uuid
           )
         `,
-        ...managerIds.map(
+        // Assignees BEFORE managers: for a developer/operations creator, the
+        // task_managers policy (fn_created_task) can only see the new task once
+        // they are its assignee.
+        ...assigneeIds.map(
           (id) => sql`
-            INSERT INTO task_managers (task_id, user_id)
+            INSERT INTO task_assignees (task_id, user_id)
             VALUES (${taskId}::uuid, ${id}::uuid)
             ON CONFLICT (task_id, user_id) DO NOTHING
           `,
         ),
-        ...assigneeIds.map(
+        ...managerIds.map(
           (id) => sql`
-            INSERT INTO task_assignees (task_id, user_id)
+            INSERT INTO task_managers (task_id, user_id)
             VALUES (${taskId}::uuid, ${id}::uuid)
             ON CONFLICT (task_id, user_id) DO NOTHING
           `,
@@ -1065,6 +1153,7 @@ export function registerTools(
         .describe('Percent shares must total exactly 100.'),
     },
     guard(async (a: any) => {
+      assertReceivedAllowed(a.status);
       const paymentId = crypto.randomUUID();
 
       // Dedupe by user_id (last wins), then check the 100% rule up front so the
@@ -1454,6 +1543,9 @@ export function registerTools(
       loom_url: z.string().max(1000).optional(),
       requirement: z.string().max(20000).optional(),
       details: z.string().max(20000).optional(),
+      is_management: bool(z.boolean().optional()).describe(
+        'Move the task into (true) or out of (false) the management stream. Admins only.',
+      ),
       clear_fields: z
         .array(z.enum(['start_date', 'plan_due_date', 'execution_start_date',
                        'execution_end_date', 'estimated_hours', 'time_reported_hours',
@@ -1466,26 +1558,25 @@ export function registerTools(
       if (given.length === 0 && clear.length === 0) {
         throw new Error('Pass at least one field to change or clear.');
       }
-      // Role limit (permissions.ts): some roles may touch only a few fields, and
-      // only on tasks they are assigned to. Checked before anything is written.
+      // Role limits (permissions.ts), checked before anything is written: some
+      // roles may not touch certain fields, and only tasks they are assigned to.
       const limit = rulesFor(role, 'update_task');
       if (limit) {
         const notAllowed = [...new Set([...given, ...clear])].filter(
-          (f) => !limit.allowedFields.includes(f),
+          (f) => limit.deniedFields.includes(f),
         );
         if (notAllowed.length > 0) {
-          throw new Error(
-            `Your role (${role}) can only change: ${limit.allowedFields.join(', ')}. `
-            + `Not allowed: ${notAllowed.join(', ')}.`,
-          );
+          throw new Error(`Your role (${role}) cannot change: ${notAllowed.join(', ')}.`);
         }
         if (limit.assigneeOnly) await assertAssignee(a.task_id);
       }
+      assertManagementAllowed(a.is_management);
       const rows = await asUser(actor, (sql) => sql`
         UPDATE tasks SET
           title                = COALESCE(${a.title ?? null}, title),
           priority             = COALESCE(${a.priority ?? null}::priority, priority),
           delivery_state       = COALESCE(${a.delivery_state ?? null}::task_delivery_state, delivery_state),
+          is_management        = COALESCE(${a.is_management ?? null}::boolean, is_management),
           start_date           = CASE WHEN 'start_date'           = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.start_date ?? null}::date, start_date) END,
           plan_due_date        = CASE WHEN 'plan_due_date'        = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.plan_due_date ?? null}::date, plan_due_date) END,
           execution_start_date = CASE WHEN 'execution_start_date' = ANY(${clear}::text[]) THEN NULL ELSE COALESCE(${a.execution_start_date ?? null}::date, execution_start_date) END,
@@ -1500,7 +1591,7 @@ export function registerTools(
         RETURNING id, display_id, title, status::text AS status, priority::text AS priority,
                   to_char(start_date, 'YYYY-MM-DD') AS start_date,
                   to_char(plan_due_date, 'YYYY-MM-DD') AS plan_due_date,
-                  estimated_hours
+                  estimated_hours, is_management
       `);
       if (rows.length === 0) throw new Error('Update not permitted or task not found.');
       return { updated: given, cleared: clear, task: rows[0] };
@@ -1581,16 +1672,10 @@ export function registerTools(
       status: z.string().min(1),
     },
     guard(async (a: any) => {
-      // Role limit (permissions.ts): own tasks only, and optionally a status list.
-      const limit = rulesFor(role, 'set_task_status');
-      if (limit) {
-        if (limit.allowedStatuses && !limit.allowedStatuses.includes(a.status)) {
-          throw new Error(
-            `Your role (${role}) can only set these statuses: ${limit.allowedStatuses.join(', ')}.`,
-          );
-        }
-        if (limit.assigneeOnly) await assertAssignee(a.task_id);
-      }
+      // Role limits (permissions.ts): own tasks only for some roles, a status
+      // list for some, and "done" needs every assignee rated (except super_admin).
+      await assertStatusAllowed(a.status, a.task_id);
+      if (rulesFor(role, 'set_task_status')?.assigneeOnly) await assertAssignee(a.task_id);
       const rows = await asUser(actor, (sql) => sql`
         UPDATE tasks
            SET status = ${a.status}::task_status, updated_at = now()
@@ -1636,9 +1721,11 @@ export function registerTools(
       status: z.string().min(1),
     },
     guard(async (a: any) => {
+      // Only admins mark a payment received (the DB trigger
+      // trg_payment_received_admin agrees); this gives the clean message first.
+      assertReceivedAllowed(a.status);
       // Mirrors assertReceivable: money-in figures must exist before a payment
-      // can be marked received. The DB trigger trg_payment_received_admin is the
-      // real gate; this is the clean message.
+      // can be marked received.
       if (a.status === 'received') {
         const rows = await asUser<{ amount: string | null; received_amount_inr: string | null }>(
           actor,
@@ -1817,6 +1904,9 @@ export function registerTools(
       id: z.string().uuid(),
     },
     guard(async (a: any) => {
+      if (!recordAllowed(role, a.entity)) {
+        throw new Error(`Your role (${role}) cannot fetch ${a.entity} records.`);
+      }
       const id = a.id;
       let rows: Record<string, unknown>[];
       switch (a.entity) {
@@ -1909,7 +1999,9 @@ export function registerTools(
             WHERE p.id = ${id}::uuid`);
       }
       // Not-found and RLS-denied are deliberately indistinguishable.
-      return rows[0] ?? null;
+      const row = rows[0] ?? null;
+      if (row && (a.entity === 'project' || a.entity === 'milestone')) return stripMoney(role, a.entity, row);
+      return row;
     }),
   );
 
@@ -1926,6 +2018,9 @@ export function registerTools(
       reason: z.string().trim().min(3).max(1000).describe('Required, 3-1000 chars. Goes on the audit row.'),
     },
     guard(async (a: any) => {
+      if (!archiveAllowed(role, a.entity)) {
+        throw new Error(`Your role (${role}) cannot archive ${a.entity} records.`);
+      }
       const id = a.id;
       const why = String(a.reason).trim();
       let rows: Record<string, unknown>[];
@@ -1988,6 +2083,20 @@ export function registerTools(
     'Assign a user to a task (who does the work). Idempotent.',
     { task_id: z.string().uuid(), user_id: z.string().uuid() },
     guard(async (a: any) => {
+      // Role limit (permissions.ts): assigning yourself needs you to already be
+      // a manager or the creator of the task (closes a self-assign visibility gap).
+      if (a.user_id === actor.uid && rulesFor(role, 'add_task_assignee')?.selfNeedsManagerOrCreator) {
+        const rel = await asUser(actor, (sql) => sql`
+          SELECT 1 AS ok FROM tasks t
+          WHERE t.id = ${a.task_id}::uuid
+            AND (t.created_by = ${actor.uid}::uuid
+                 OR EXISTS (SELECT 1 FROM task_managers tm
+                            WHERE tm.task_id = t.id AND tm.user_id = ${actor.uid}::uuid))
+        `);
+        if (rel.length === 0) {
+          throw new Error('You can only assign yourself to a task you manage or created.');
+        }
+      }
       const rows = await asUser(actor, (sql) => sql`
         INSERT INTO task_assignees (task_id, user_id)
         VALUES (${a.task_id}::uuid, ${a.user_id}::uuid)
@@ -2552,7 +2661,7 @@ export function registerTools(
     },
     guard(async (a: any) => {
       const like = `%${a.query}%`;
-      return asUser(actor, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         SELECT p.id, p.display_id, p.name, p.status::text AS status,
                p.start_date::text AS start_date, p.deal_id,
                c.full_name AS client_name
@@ -2563,6 +2672,7 @@ export function registerTools(
         ORDER BY p.created_at DESC
         LIMIT ${a.limit ?? 20}
       `);
+      return rows.map((r) => stripMoney(role, 'project', r));
     }),
   );
 
@@ -2577,7 +2687,7 @@ export function registerTools(
     guard(async (a: any) => {
       const q = a.query ? `%${a.query}%` : null;
       const projectId = a.project_id ?? null;
-      return asUser(actor, (sql) => sql`
+      const rows = await asUser(actor, (sql) => sql`
         SELECT m.id, m.display_id, m.name, m.status::text AS status,
                m.project_id, p.name AS project_name
         FROM milestones m
@@ -2588,6 +2698,7 @@ export function registerTools(
         ORDER BY p.name, m.created_at
         LIMIT ${a.limit ?? 20}
       `);
+      return rows.map((r) => stripMoney(role, 'milestone', r));
     }),
   );
 }

@@ -18,6 +18,8 @@
 //     always runs. `npm run e2e -- --cleanup-only` re-runs just the cleanup.
 //   * Notification safety: every test task's ONLY assignee/manager is the test
 //     developer; comments are posted by the task's creator (sender is excluded).
+//     Two approved exceptions, where the only legal assignee is the actor:
+//     the operations user's self-assigned task, and the pm's self-assign.
 //
 // Never imported by src/.
 
@@ -27,7 +29,7 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 import worker from '../src/index';
 import type { Env } from '../src/db';
-import { ALL_TOOLS, toolsForRole } from '../src/permissions';
+import { NEVER_RETURN_FIELDS, toolsForRole } from '../src/permissions';
 
 // ---------------------------------------------------------------------------
 // Setup + safety
@@ -139,15 +141,31 @@ async function rpc(token: string | null, method: string, params: unknown = {}) {
 type User = { role: string; id: string; display_id: string; full_name: string; email: string; sub: string; token: string };
 type CallResult = { ok: boolean; data?: any; error?: string };
 
+// Every tool output is scanned for rating fields (work_ratings values / reviewer).
+const ratingLeaks: string[] = [];
+let outputsScanned = 0;
+function scanForRatings(tool: string, v: unknown) {
+  if (Array.isArray(v)) { v.forEach((x) => scanForRatings(tool, x)); return; }
+  if (v && typeof v === 'object') {
+    for (const [k, x] of Object.entries(v)) {
+      if (NEVER_RETURN_FIELDS.has(k)) ratingLeaks.push(`${tool}.${k}`);
+      scanForRatings(tool, x);
+    }
+  }
+}
+
 async function call(u: User, name: string, a: Record<string, unknown> = {}): Promise<CallResult> {
   const r = await rpc(u.token, 'tools/call', { name, arguments: a });
   if (r.status !== 200) return { ok: false, error: `HTTP ${r.status} ${JSON.stringify(r.body)}` };
   if (r.body?.error) return { ok: false, error: r.body.error.message ?? JSON.stringify(r.body.error) };
   const res = r.body?.result;
   const text = (res?.content ?? []).map((c: any) => c.text).join('\n');
+  outputsScanned += 1;
+  for (const f of NEVER_RETURN_FIELDS) if (new RegExp(`"${f}"\\s*:`).test(text)) ratingLeaks.push(`${name}: "${f}" in text`);
   if (res?.isError) return { ok: false, error: text };
-  try { return { ok: true, data: JSON.parse(text) }; } catch { return { ok: true, data: text }; }
+  try { const data = JSON.parse(text); scanForRatings(name, data); return { ok: true, data }; } catch { return { ok: true, data: text }; }
 }
+const hasMoney = (v: unknown): boolean => /"(price|currency)"\s*:/.test(JSON.stringify(v ?? null));
 
 // ---------------------------------------------------------------------------
 // Results + manifest
@@ -195,6 +213,7 @@ const [otherDev] = await readAs<{ id: string; display_id: string }>(SERVICE_UID,
 console.log('\nTest users (real, active, test branch):');
 for (const r of ROLES) console.log(`  ${r.padEnd(12)} ${users[r] ? `${users[r].display_id} ${users[r].full_name}` : '(none — role untestable)'}`);
 const admin = users.admin, pm = users.pm, sales = users.sales, dev = users.developer;
+const ops = users.operations, sa = users.super_admin;
 if (!admin || !dev || dev.id !== DEVELOPER_ID) { console.error('Required admin/developer users not found; stopping.'); process.exit(2); }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +257,7 @@ async function cleanup() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-const EXPECTED: Record<string, number> = { super_admin: 48, admin: 48, pm: 48, sales: 22, developer: 17, internal: 17 };
+const EXPECTED: Record<string, number> = { super_admin: 48, admin: 48, pm: 48, sales: 24, developer: 18, operations: 18 };
 const ids: Record<string, string> = {};
 
 async function s1Visibility() {
@@ -254,11 +273,11 @@ async function s1Visibility() {
     check(S, `${role} sees exactly its permissions.ts tools`, r.status === 200 && same && names.length === EXPECTED[role],
       `${names.length}/${EXPECTED[role]}${same ? '' : ` extra=[${names.filter((n) => !want.includes(n as any))}] missing=[${want.filter((n) => !names.includes(n))}]`}`);
   }
-  if (users.operations) {
-    const r = await rpc(users.operations.token, 'tools/list');
-    check(S, 'operations sign-in refused with 403 + message', r.status === 403 && /Your role \(operations\) does not have MCP access yet/.test(JSON.stringify(r.body)), `HTTP ${r.status} ${short(JSON.stringify(r.body))}`);
-  } else skip(S, 'operations 403', 'no active operations user');
-  for (const [u, tool] of [[dev, 'create_task'], [dev, 'get_payments'], [sales, 'get_payments'], [sales, 'list_tasks']] as const) {
+  if (users.internal) {
+    const r = await rpc(users.internal.token, 'tools/list');
+    check(S, 'M1 internal sign-in refused with 403 + message', r.status === 403 && /Your role \(internal\) does not have MCP access yet/.test(JSON.stringify(r.body)), `HTTP ${r.status} ${short(JSON.stringify(r.body))}`);
+  } else skip(S, 'internal 403', 'no active internal user');
+  for (const [u, tool] of [[dev, 'get_payments'], [ops, 'get_payments'], [ops, 'archive_record'], [sales, 'get_payments'], [sales, 'list_tasks']] as const) {
     if (!u) continue;
     const r = await call(u, tool, {});
     check(S, `${u.role} calling hidden ${tool} is refused`, !r.ok, short(r.error, 100));
@@ -362,7 +381,11 @@ async function s5AdminWrites() {
     if (pmm.ok) { manifest.joins.push({ kind: 'project_member', a: ids.project, b: pm.id }); saveManifest(); }
   }
 
-  const ms = await call(admin, 'create_milestone', { name: `${PREFIX} Milestone`, project_id: ids.project, status: 'skip', estimated_hours: 'skip' });
+  const dm = await call(admin, 'add_project_member', { project_id: ids.project, user_id: dev.id, role: 'developer' });
+  check(S, 'add_project_member (developer, for the M5 money checks)', dm.ok, dm.ok ? '' : short(dm.error));
+  if (dm.ok) { manifest.joins.push({ kind: 'project_member', a: ids.project, b: dev.id }); saveManifest(); }
+
+  const ms = await call(admin, 'create_milestone', { name: `${PREFIX} Milestone`, project_id: ids.project, status: 'skip', estimated_hours: 'skip', price: 500, currency: 'USD' });
   check(S, 'create_milestone', ms.ok, ms.ok ? ms.data.display_id : short(ms.error));
   if (!ms.ok) return; ids.milestone = ms.data.id; created('milestone', ms.data.id, admin);
   check(S, 'milestone created_by = acting admin', ms.data.created_by === admin.id && notService(ms.data.created_by), String(ms.data.created_by));
@@ -429,7 +452,7 @@ async function s6OtherRoles() {
     const co = await call(sales, 'create_company', { name: `${PREFIX} Company (sales)`, type: 'prospect', website: 'skip', industry: 'skip', company_size: 'skip', location: 'skip', account_owner_id: 'skip' });
     check(S, 'sales: create_company', co.ok, co.ok ? co.data.display_id : short(co.error));
     if (co.ok) {
-      created('company', co.data.id, sales);
+      created('company', co.data.id, sales); ids.salesCompany = co.data.id;
       check(S, 'sales: company created_by = sales user', co.data.created_by === sales.id, String(co.data.created_by));
       const ct = await call(sales, 'create_contact', { full_name: `${PREFIX} Contact (sales)`, status: 'prospect', primary_owner_id: 'skip', company_id: co.data.id });
       check(S, 'sales: create_contact (owner = sales user)', ct.ok && ct.data.primary_owner_id === sales.id, ct.ok ? String(ct.data.primary_owner_id) : short(ct.error));
@@ -438,7 +461,7 @@ async function s6OtherRoles() {
         check(S, 'sales: contact created_by = sales user', ct.data.created_by === sales.id, String(ct.data.created_by));
         const dl = await call(sales, 'create_deal', { name: `${PREFIX} Deal (sales)`, contact_id: ct.data.id, pipeline_id: ids.pipeline, stage_id: ids.stage1, deal_value: 500, currency: 'USD', initial_deal_amount: 'skip', lead_type: 'skip', source: 'skip', primary_owner_id: 'skip', close_date: 'skip' });
         check(S, 'sales: create_deal (owner = sales user)', dl.ok && dl.data.primary_owner_id === sales.id, dl.ok ? String(dl.data.primary_owner_id) : short(dl.error));
-        if (dl.ok) { created('deal', dl.data.id, sales); check(S, 'sales: deal created_by = sales user', dl.data.created_by === sales.id, String(dl.data.created_by)); }
+        if (dl.ok) { created('deal', dl.data.id, sales); ids.salesDeal = dl.data.id; ids.salesContact = ct.data.id; check(S, 'sales: deal created_by = sales user', dl.data.created_by === sales.id, String(dl.data.created_by)); }
       }
     }
   } else skip(S, 'sales writes', 'no active sales user');
@@ -447,24 +470,28 @@ async function s6OtherRoles() {
     const t = await call(pm, 'create_task', { title: `${PREFIX} Task (pm)`, parent_id: ids.milestone, parent_type: 'milestone', manager_ids: [dev.id], assignee_ids: [dev.id], status: 'skip', priority: 'skip', plan_due_date: 'skip', estimated_hours: 'skip', requirement: 'skip', start_date: 'skip' });
     check(S, 'pm: create_task in the test project they manage', t.ok, t.ok ? t.data.display_id : short(t.error));
     if (t.ok) {
-      created('task', t.data.id, pm);
+      created('task', t.data.id, pm); ids.pmTask = t.data.id;
       manifest.joins.push({ kind: 'task_manager', a: t.data.id, b: dev.id }, { kind: 'task_assignee', a: t.data.id, b: dev.id }); saveManifest();
       check(S, 'pm task created_by = pm', t.data.created_by === pm.id, String(t.data.created_by));
     }
   } else skip(S, 'pm create_task', pm ? 'no test milestone (admin path failed)' : 'no active pm user');
-
-  const dt = await call(dev, 'create_task', { title: `${PREFIX} should not exist`, parent_id: ids.milestone ?? DEVELOPER_ID });
-  check(S, 'developer: create_task refused (tool hidden)', !dt.ok, short(dt.error, 90));
 }
 
 async function s4DeveloperRules() {
   console.log('\n[4] Developer rules (test tasks only)');
   const S = '4 Developer rules';
   if (!ids.taskA || !ids.taskB) { skip(S, 'developer rules', 'test tasks were not created'); return; }
-  const f1 = await call(dev, 'update_task', { task_id: ids.taskA, title: `${PREFIX} renamed` });
-  check(S, 'update_task with a non-allowed field (title) refused', !f1.ok && /can only change/.test(f1.error ?? ''), short(f1.error, 110));
-  const f2 = await call(dev, 'update_task', { task_id: ids.taskA, clear_fields: ['requirement'] });
-  check(S, 'update_task clearing a non-allowed field refused', !f2.ok && /can only change/.test(f2.error ?? ''), short(f2.error, 110));
+  const newTitle = `${PREFIX} Task A (developer, renamed)`;
+  const f1 = await call(dev, 'update_task', { task_id: ids.taskA, title: newTitle, priority: 'high', requirement: `${PREFIX} requirement` });
+  check(S, 'D2 update_task title + priority + requirement on assigned task works', f1.ok, f1.ok ? '' : short(f1.error, 110));
+  if (f1.ok) {
+    const rec = await call(admin, 'get_record', { entity: 'task', id: ids.taskA });
+    check(S, 'D2 ...and the values were saved', rec.data?.title === newTitle && rec.data?.priority === 'high' && rec.data?.requirement === `${PREFIX} requirement`, `title=${rec.data?.title} priority=${rec.data?.priority}`);
+  }
+  const f2 = await call(dev, 'update_task', { task_id: ids.taskA, clear_fields: ['details'] });
+  check(S, 'D2 update_task clearing a field on assigned task works', f2.ok, f2.ok ? '' : short(f2.error, 110));
+  const f3 = await call(dev, 'update_task', { task_id: ids.taskA, is_management: true });
+  check(S, 'D2/M6 developer update_task is_management refused', !f3.ok && /cannot change: is_management/.test(f3.error ?? ''), short(f3.error, 110));
   const nb = await call(dev, 'update_task', { task_id: ids.taskB, loom_url: 'https://example.com/mcp-test-b' });
   check(S, 'update_task on a task NOT assigned to the developer refused', !nb.ok && /assigned to/.test(nb.error ?? ''), short(nb.error, 90));
   const ok = await call(dev, 'update_task', { task_id: ids.taskA, loom_url: 'https://example.com/mcp-test', time_reported_hours: 1.5 });
@@ -475,6 +502,12 @@ async function s4DeveloperRules() {
   }
   const so = await call(dev, 'set_task_status', { task_id: ids.taskA, status: 'in_progress' });
   check(S, 'set_task_status on own (assigned) task works', so.ok && so.data.status === 'in_progress', so.ok ? '' : short(so.error));
+  const sq = await call(dev, 'set_task_status', { task_id: ids.taskA, status: 'qa_review' });
+  check(S, 'M2 developer set_task_status qa_review works', sq.ok && sq.data.status === 'qa_review', sq.ok ? '' : short(sq.error));
+  for (const st of ['done', 'stuck']) {
+    const r = await call(dev, 'set_task_status', { task_id: ids.taskA, status: st });
+    check(S, `M2 developer set_task_status ${st} refused`, !r.ok && /can only set these statuses/.test(r.error ?? ''), short(r.error, 100));
+  }
   const sx = await call(dev, 'set_task_status', { task_id: ids.taskB, status: 'in_progress' });
   check(S, 'set_task_status on another task refused', !sx.ok, short(sx.error, 90));
   const today = new Date().toISOString().slice(0, 10);
@@ -546,6 +579,168 @@ async function s7Uploads() {
   } else check(S, 'developer: start_attachment_upload on own task', false, short(sd.error, 100));
 }
 
+async function s9Portal() {
+  console.log('\n[9] Portal role rules (M1-M6, D1-D6, EXTRA, ratings)');
+  const S = '9 Portal rules';
+  if (!ids.milestone || !ids.taskA || !ids.taskB) { skip(S, 'portal rules', 'test records missing'); return; }
+  const base = { parent_id: ids.milestone, parent_type: 'milestone', priority: 'skip', plan_due_date: 'skip', estimated_hours: 'skip', requirement: 'skip', start_date: 'skip' };
+  const other = otherDev?.id ?? admin.id;
+
+  // D1 + M2 + M6 — developer create_task
+  const d1 = await call(dev, 'create_task', { ...base, title: `${PREFIX} Task (developer self)`, status: 'skip', manager_ids: [dev.id], assignee_ids: [dev.id] });
+  check(S, 'D1 developer create_task assigned to self works', d1.ok, d1.ok ? d1.data.display_id : short(d1.error));
+  if (d1.ok) {
+    created('task', d1.data.id, dev); ids.devTask = d1.data.id;
+    manifest.joins.push({ kind: 'task_manager', a: d1.data.id, b: dev.id }, { kind: 'task_assignee', a: d1.data.id, b: dev.id }); saveManifest();
+    check(S, 'D1 ...created_by = developer, is_management false', d1.data.created_by === dev.id && d1.data.is_management === false, `${d1.data.created_by} mgmt=${d1.data.is_management}`);
+  }
+  for (const [label, assignees] of [['another user', [other]], ['"skip" (unassigned)', 'skip'], ['self + another user', [dev.id, other]]] as const) {
+    const r = await call(dev, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: 'skip', assignee_ids: assignees });
+    check(S, `D1 developer create_task assigned to ${label} refused`, !r.ok && /assigned to yourself/.test(r.error ?? ''), short(r.error, 100));
+  }
+  const d2 = await call(dev, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'done', manager_ids: 'skip', assignee_ids: [dev.id] });
+  check(S, 'M2 developer create_task status=done refused', !d2.ok && /can only set these statuses/.test(d2.error ?? ''), short(d2.error, 100));
+  const d3 = await call(dev, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: 'skip', assignee_ids: [dev.id], is_management: true });
+  check(S, 'M6 developer create_task is_management=true refused', !d3.ok && /management task/.test(d3.error ?? ''), short(d3.error, 100));
+
+  // D6 — operations: same tools and rules as developer
+  if (ops) {
+    const o1 = await call(ops, 'create_task', { ...base, title: `${PREFIX} Task (operations self)`, status: 'skip', manager_ids: 'skip', assignee_ids: [ops.id] });
+    check(S, 'D6/D1 operations create_task assigned to self works', o1.ok, o1.ok ? o1.data.display_id : short(o1.error));
+    if (o1.ok) {
+      created('task', o1.data.id, ops); ids.opsTask = o1.data.id;
+      manifest.joins.push({ kind: 'task_assignee', a: o1.data.id, b: ops.id }); saveManifest();
+      check(S, 'D6 ...created_by = operations user', o1.data.created_by === ops.id, String(o1.data.created_by));
+      const ou = await call(ops, 'update_task', { task_id: o1.data.id, title: `${PREFIX} Task (operations, renamed)`, priority: 'low' });
+      check(S, 'D6/D2 operations update_task on own task works', ou.ok && ou.data.task?.priority === 'low', ou.ok ? '' : short(ou.error));
+      const oq = await call(ops, 'set_task_status', { task_id: o1.data.id, status: 'qa_review' });
+      check(S, 'D6/M2 operations set_task_status qa_review works', oq.ok && oq.data.status === 'qa_review', oq.ok ? '' : short(oq.error));
+      const od = await call(ops, 'set_task_status', { task_id: o1.data.id, status: 'done' });
+      check(S, 'D6/M2 operations set_task_status done refused', !od.ok && /can only set these statuses/.test(od.error ?? ''), short(od.error, 100));
+    }
+    const o2 = await call(ops, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: 'skip', assignee_ids: [dev.id] });
+    check(S, 'D6/D1 operations create_task assigned to someone else refused', !o2.ok && /assigned to yourself/.test(o2.error ?? ''), short(o2.error, 100));
+    const o3 = await call(ops, 'update_task', { task_id: ids.taskB, title: `${PREFIX} nope` });
+    check(S, 'D6/D2 operations update_task on a task not assigned to them refused', !o3.ok, short(o3.error, 100));
+  } else skip(S, 'operations rules', 'no active operations user');
+
+  // M6 — is_management
+  const m1 = await call(admin, 'create_task', { ...base, title: `${PREFIX} Task (management)`, status: 'skip', manager_ids: [dev.id], assignee_ids: [dev.id], is_management: true });
+  check(S, 'M6 admin create_task is_management=true works', m1.ok && m1.data.is_management === true, m1.ok ? m1.data.display_id : short(m1.error));
+  if (m1.ok) {
+    created('task', m1.data.id, admin); ids.mgmtTask = m1.data.id;
+    manifest.joins.push({ kind: 'task_manager', a: m1.data.id, b: dev.id }, { kind: 'task_assignee', a: m1.data.id, b: dev.id }); saveManifest();
+    const m2 = await call(admin, 'update_task', { task_id: m1.data.id, is_management: false });
+    check(S, 'M6 admin update_task is_management=false works', m2.ok && m2.data.task?.is_management === false, m2.ok ? '' : short(m2.error));
+  }
+  if (pm) {
+    const m3 = await call(pm, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: [dev.id], assignee_ids: 'skip', is_management: true });
+    check(S, 'M6 pm create_task is_management=true refused', !m3.ok && /management task/.test(m3.error ?? ''), short(m3.error, 100));
+    if (ids.pmTask) {
+      const m4 = await call(pm, 'update_task', { task_id: ids.pmTask, is_management: true });
+      check(S, 'M6 pm update_task is_management refused', !m4.ok && /cannot set or change is_management/.test(m4.error ?? ''), short(m4.error, 100));
+    }
+  }
+
+  // M4 — payment "received"
+  if (pm && ids.payment) {
+    const p1 = await call(pm, 'set_payment_status', { payment_id: ids.payment, status: 'received' });
+    check(S, 'M4 pm set_payment_status received refused (clear message)', !p1.ok && /Only an admin or super admin/.test(p1.error ?? ''), short(p1.error, 100));
+    const p2 = await call(pm, 'create_payment', { deal_id: ids.deal, amount: 50, currency: 'USD', submitted_amount: 50, status: 'received', note: `${PREFIX} should not exist` });
+    check(S, 'M4 pm create_payment status=received refused', !p2.ok && /Only an admin or super admin/.test(p2.error ?? ''), short(p2.error, 100));
+  }
+  if (sa && ids.deal) {
+    const p3 = await call(sa, 'create_payment', { deal_id: ids.deal, amount: 50, currency: 'USD', submitted_amount: 50, received_amount_inr: 4150, status: 'received', note: `${PREFIX} payment (super_admin received)` });
+    check(S, 'M4 super_admin create_payment status=received works', p3.ok && p3.data.status === 'received', p3.ok ? p3.data.display_id : short(p3.error));
+    if (p3.ok) created('payment', p3.data.id, sa);
+  } else skip(S, 'M4 super_admin', 'no active super_admin user');
+
+  // M5 — money columns
+  if (pm) {
+    const g = await call(pm, 'get_record', { entity: 'milestone', id: ids.milestone });
+    check(S, 'M5 pm get_record milestone shows price/currency', g.ok && Number(g.data?.price) === 500 && g.data?.currency?.trim() === 'USD', `price=${g.data?.price} currency=${g.data?.currency}`);
+  }
+  for (const u of [sales, dev, ops].filter(Boolean) as User[]) {
+    const g = await call(u, 'get_record', { entity: 'milestone', id: ids.milestone });
+    check(S, `M5 ${u.role} get_record milestone has no price/currency`, g.ok && g.data?.id === ids.milestone && !hasMoney(g.data), g.ok ? `keys=${Object.keys(g.data ?? {}).length}` : short(g.error));
+    const fp = await call(u, 'find_project', { query: PREFIX, limit: 20 });
+    check(S, `M5 ${u.role} find_project has no money fields`, fp.ok && !hasMoney(fp.data), fp.ok ? `rows=${fp.data.length}` : short(fp.error));
+    if (u !== sales) {
+      const fm = await call(u, 'find_milestone', { project_id: ids.project });
+      check(S, `M5 ${u.role} find_milestone has no price/currency`, fm.ok && fm.data.length > 0 && !hasMoney(fm.data), fm.ok ? `rows=${fm.data.length}` : short(fm.error));
+      const lt = await call(u, 'list_tasks', { search: PREFIX, full: true, limit: 50 });
+      check(S, `M5 ${u.role} list_tasks has no money fields`, lt.ok && !hasMoney(lt.data), lt.ok ? `rows=${lt.data.length}` : short(lt.error));
+    }
+  }
+
+  // get_record deal / payment
+  for (const u of [dev, ops].filter(Boolean) as User[]) {
+    const gd = await call(u, 'get_record', { entity: 'deal', id: ids.deal });
+    check(S, `${u.role} get_record deal refused`, !gd.ok && /cannot fetch deal/.test(gd.error ?? ''), short(gd.error, 90));
+    const gp = await call(u, 'get_record', { entity: 'payment', id: ids.payment ?? ids.deal });
+    check(S, `${u.role} get_record payment refused`, !gp.ok && /cannot fetch payment/.test(gp.error ?? ''), short(gp.error, 90));
+  }
+  const ga = await call(admin, 'get_record', { entity: 'deal', id: ids.deal });
+  check(S, 'admin get_record deal works', ga.ok && ga.data?.id === ids.deal, ga.ok ? '' : short(ga.error));
+  if (sales && ids.salesDeal) {
+    const gs = await call(sales, 'get_record', { entity: 'deal', id: ids.salesDeal });
+    check(S, 'sales get_record deal works (deal_value kept)', gs.ok && gs.data?.id === ids.salesDeal && 'deal_value' in (gs.data ?? {}), gs.ok ? `deal_value=${gs.data?.deal_value}` : short(gs.error));
+    const gp = await call(sales, 'get_record', { entity: 'payment', id: ids.payment ?? ids.deal });
+    check(S, 'sales get_record payment refused', !gp.ok && /cannot fetch payment/.test(gp.error ?? ''), short(gp.error, 90));
+  }
+
+  // D4 — sales get_credentials (metadata only)
+  if (sales && ids.salesContact) {
+    const c = await call(sales, 'get_credentials', { parent_type: 'contact', parent_id: ids.salesContact });
+    check(S, 'D4 sales get_credentials works (metadata only)', c.ok && typeof c.data?.count === 'number' && !/secret_ref|password/i.test(JSON.stringify(c.data?.credentials ?? [])), c.ok ? `count=${c.data.count}` : short(c.error));
+  }
+
+  // EXTRA — pm self-assign
+  if (pm) {
+    const e1 = await call(pm, 'add_task_assignee', { task_id: ids.taskB, user_id: pm.id });
+    check(S, 'EXTRA pm self-assign on a task they neither manage nor created refused', !e1.ok && /manage or created/.test(e1.error ?? ''), short(e1.error, 100));
+    if (ids.pmTask) {
+      const e2 = await call(pm, 'add_task_assignee', { task_id: ids.pmTask, user_id: pm.id });
+      check(S, 'EXTRA pm self-assign on a task they created works', e2.ok && !e2.data?.already_assigned, e2.ok ? '' : short(e2.error));
+      if (e2.ok) { manifest.joins.push({ kind: 'task_assignee', a: ids.pmTask, b: pm.id }); saveManifest(); }
+      const e3 = await call(pm, 'add_task_assignee', { task_id: ids.pmTask, user_id: dev.id });
+      check(S, 'EXTRA pm assigning someone else is not limited', e3.ok, e3.ok ? JSON.stringify(e3.data).slice(0, 60) : short(e3.error));
+    }
+  }
+
+  // D3 — sales archive: deals only
+  if (sales && ids.salesCompany && ids.salesDeal) {
+    const a1 = await call(sales, 'archive_record', { entity: 'company', id: ids.salesCompany, reason: CLEANUP_REASON });
+    check(S, 'D3 sales archive_record company refused', !a1.ok && /cannot archive company/.test(a1.error ?? ''), short(a1.error, 100));
+    const a2 = await call(sales, 'archive_record', { entity: 'deal', id: ids.salesDeal, reason: CLEANUP_REASON });
+    check(S, 'D3 sales archive_record deal works', a2.ok && a2.data?.archived === 'deal', a2.ok ? '' : short(a2.error));
+  }
+
+  // M3 — done needs every assignee rated (runs last: it closes task A and task B)
+  const r1 = await call(admin, 'set_task_status', { task_id: ids.taskA, status: 'done' });
+  check(S, 'M3 admin done on task with an unrated assignee refused', !r1.ok && /Rate every assignee/.test(r1.error ?? '') && r1.error!.includes(dev.full_name), short(r1.error, 120));
+  if (pm && ids.pmTask) {
+    const r2 = await call(pm, 'set_task_status', { task_id: ids.pmTask, status: 'done' });
+    check(S, 'M3 pm done on task with unrated assignees refused', !r2.ok && /Rate every assignee/.test(r2.error ?? ''), short(r2.error, 120));
+  }
+  const r3 = await call(admin, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'done', manager_ids: 'skip', assignee_ids: [dev.id] });
+  check(S, 'M3 admin create_task status=done with an assignee refused', !r3.ok && /cannot be created as done/.test(r3.error ?? ''), short(r3.error, 120));
+  const r4 = await call(admin, 'create_task', { ...base, title: `${PREFIX} Task (created done, no assignees)`, status: 'done', manager_ids: 'skip', assignee_ids: 'skip' });
+  check(S, 'M3 admin create_task status=done with no assignees works', r4.ok && r4.data.status === 'done', r4.ok ? r4.data.display_id : short(r4.error));
+  if (r4.ok) created('task', r4.data.id, admin);
+  const r5 = await call(admin, 'set_task_status', { task_id: ids.taskB, status: 'done' });
+  check(S, 'M3 admin done on task with no assignees works', r5.ok && r5.data.status === 'done', r5.ok ? '' : short(r5.error));
+  if (sa) {
+    const r6 = await call(sa, 'set_task_status', { task_id: ids.taskA, status: 'done' });
+    check(S, 'M3 super_admin done on task with an unrated assignee works', r6.ok && r6.data.status === 'done', r6.ok ? '' : short(r6.error));
+  }
+}
+
+function sRatings() {
+  console.log('\n[10] Ratings never leave the server');
+  check('10 Ratings', `no tool output contains work_ratings fields (${outputsScanned} outputs scanned)`, ratingLeaks.length === 0, ratingLeaks.slice(0, 5).join(', '));
+}
+
 // ---------------------------------------------------------------------------
 let failedCleanup: string[] = [];
 try {
@@ -558,6 +753,8 @@ try {
     await s6OtherRoles();
     await s4DeveloperRules();
     await s7Uploads();
+    await s9Portal();
+    sRatings();
   }
 } catch (e) {
   check('runtime', 'test run completed without crashing', false, short(e instanceof Error ? `${e.message} ${e.stack?.split('\n')[1] ?? ''}` : String(e), 300));
@@ -572,7 +769,7 @@ for (const r of results.filter((x) => x.result !== 'PASS')) console.log(`  ${r.r
 console.log('\nLeft in the database by design (cannot be archived through MCP; all hang off archived [MCP-TEST] parents):');
 for (const l of manifest.leftovers) console.log(`  ${l.kind}: ${l.id}`);
 console.log('  plus: contact_owners / deal_owners rows, milestone_members (pm, via trigger), audit_log rows,');
-console.log('        task_notification_outbox rows (recipient U-0068 only)');
+console.log('        task_notification_outbox rows (recipient U-0068; plus U-0080 and U-0028 for the two approved self-assign cases)');
 if (failedCleanup.length) console.log(`\nCOULD NOT ARCHIVE: ${failedCleanup.join(', ')}`);
 writeFileSync('.wrangler/e2e-results.json', JSON.stringify({ results, leftovers: manifest.leftovers, failedCleanup }, null, 2));
 process.exit(by('FAIL') > 0 ? 1 : 0);
