@@ -7,7 +7,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "perms:check": "esbuild scripts/perms-check.ts --bundle --platform=node --format=esm --outfile=.wrangler/perms-check.mjs --log-level=warning && node .wrangler/perms-check.mjs"
+    "perms:check": "esbuild scripts/perms-check.ts --bundle --platform=node --format=esm --outfile=.wrangler/perms-check.mjs --log-level=warning && node .wrangler/perms-check.mjs",
+    "e2e": "esbuild scripts/e2e.ts --bundle --platform=node --format=esm --packages=external --outfile=.wrangler/e2e.mjs --log-level=warning && node .wrangler/e2e.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",

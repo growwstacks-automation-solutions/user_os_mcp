@@ -382,7 +382,7 @@ export function registerTools(
       const rows = await asUser(actor, (sql) => sql`
         INSERT INTO companies (
           name, website, industry_id, company_size, city, state, country,
-          type, about, account_owner_id
+          type, about, account_owner_id, created_by
         )
         VALUES (
           ${a.name},
@@ -394,7 +394,8 @@ export function registerTools(
           ${country},
           ${a.type}::company_type,
           ${a.about ?? null},
-          ${val<string>(a.account_owner_id)}
+          ${val<string>(a.account_owner_id)},
+          ${actor.uid}::uuid
         )
         RETURNING *
       `);
@@ -533,14 +534,15 @@ export function registerTools(
       const ownerId = val<string>(a.primary_owner_id) ?? actor.uid;
       const rows = await asUser(actor, (sql) => sql`
         WITH new_contact AS (
-          INSERT INTO contacts (full_name, email, phone, company_id, status, primary_owner_id)
+          INSERT INTO contacts (full_name, email, phone, company_id, status, primary_owner_id, created_by)
           VALUES (
             ${a.full_name},
             ${a.email ?? null},
             ${a.phone ?? null},
             ${val<string>(a.company_id)},
             COALESCE(${val<string>(a.status)}::contact_status, 'prospect'::contact_status),
-            ${ownerId}
+            ${ownerId},
+            ${actor.uid}::uuid
           )
           RETURNING *
         ), owner_row AS (
@@ -620,7 +622,7 @@ export function registerTools(
           INSERT INTO deals (
             name, contact_id, payment_type, deal_value, initial_deal_amount,
             currency, stage, close_date, primary_owner_id, pipeline_id, stage_id,
-            lead_type, source
+            lead_type, source, created_by
           )
           VALUES (
             ${a.name},
@@ -644,7 +646,8 @@ export function registerTools(
             ${a.pipeline_id}::uuid,
             ${stageId}::uuid,
             ${val<string>(a.lead_type)},
-            ${val<string>(a.source)}
+            ${val<string>(a.source)},
+            ${actor.uid}::uuid
           )
           -- Date columns as raw YYYY-MM-DD text (shadowing the * versions). The
           -- Neon driver otherwise returns a JS Date at UTC midnight, which reads
@@ -704,7 +707,7 @@ export function registerTools(
       const rows = await asUser(actor, (sql) => sql`
         INSERT INTO projects (
           name, deal_id, contact_id, status, start_date,
-          estimated_completion_date, estimated_hours, project_manager_id, apps_used
+          estimated_completion_date, estimated_hours, project_manager_id, apps_used, created_by
         )
         VALUES (
           ${a.name},
@@ -717,7 +720,8 @@ export function registerTools(
           ${val<string>(a.estimated_completion_date)}::date,
           ${val<number>(a.estimated_hours)},
           ${a.project_manager_id ?? null},
-          ${apps}::text[]
+          ${apps}::text[],
+          ${actor.uid}::uuid
         )
         -- Dates as raw text — see the note in create_deal.
         RETURNING *,
@@ -885,7 +889,7 @@ export function registerTools(
         sql`
           INSERT INTO milestones (
             id, name, project_id, status, target_date,
-            estimated_hours, price, currency
+            estimated_hours, price, currency, created_by
           )
           VALUES (
             ${milestoneId}::uuid,
@@ -895,7 +899,8 @@ export function registerTools(
             ${a.target_date ?? null}::date,
             ${val<number>(a.estimated_hours)},
             ${a.price ?? null},
-            ${a.currency ?? null}
+            ${a.currency ?? null},
+            ${actor.uid}::uuid
           )
         `,
         sql`SELECT *,
