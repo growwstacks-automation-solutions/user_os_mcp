@@ -1727,7 +1727,7 @@ export function registerTools(
           .boolean()
           .default(false)
           .describe(
-            'Return the complete field feed per task (requirement, details, delivery state, execution dates, reported hours, loom url, spine ids and timestamps) instead of the summary columns. Off by default because requirement/details can be very large across many rows.',
+            'Also return each task\'s requirement and details text. Every other field is always returned. Off by default because requirement/details can be very large across many rows.',
           ),
       ),
       limit: num(z.number().int().min(1).max(500).default(100)),
@@ -1745,27 +1745,24 @@ export function registerTools(
                -- Always present now: WHO created the task. The column existed
                -- on the row all along; this tool simply never selected it.
                t.created_by, cu.full_name AS created_by_name,
-               -- The remainder of the feed, only when full=true. A CASE keeps
+               t.delivery_state::text AS delivery_state,
+               t.primary_pm_id, pm.full_name AS primary_pm_name,
+               t.execution_start_date::text AS execution_start_date,
+               t.execution_end_date::text AS execution_end_date,
+               t.time_reported_hours, t.loom_url, t.ai_created,
+               t.parent_type::text AS parent_type, t.parent_id,
+               t.contact_id, t.company_id,
+               t.status_changed_at, t.created_at, t.updated_at,
+               -- Only the LARGE text fields wait for full=true. A CASE keeps
                -- this to ONE statement instead of branching the whole query.
                CASE WHEN ${full}::boolean THEN t.requirement END AS requirement,
                CASE WHEN ${full}::boolean THEN t.details END AS details,
-               CASE WHEN ${full}::boolean THEN t.delivery_state::text END AS delivery_state,
-               CASE WHEN ${full}::boolean THEN t.primary_pm_id END AS primary_pm_id,
-               CASE WHEN ${full}::boolean THEN pm.full_name END AS primary_pm_name,
-               CASE WHEN ${full}::boolean THEN t.execution_start_date::text END AS execution_start_date,
-               CASE WHEN ${full}::boolean THEN t.execution_end_date::text END AS execution_end_date,
-               CASE WHEN ${full}::boolean THEN t.time_reported_hours END AS time_reported_hours,
-               CASE WHEN ${full}::boolean THEN t.loom_url END AS loom_url,
-               CASE WHEN ${full}::boolean THEN t.ai_created END AS ai_created,
-               CASE WHEN ${full}::boolean THEN t.parent_type::text END AS parent_type,
-               CASE WHEN ${full}::boolean THEN t.parent_id END AS parent_id,
-               CASE WHEN ${full}::boolean THEN t.contact_id END AS contact_id,
-               CASE WHEN ${full}::boolean THEN t.company_id END AS company_id,
-               CASE WHEN ${full}::boolean THEN t.status_changed_at END AS status_changed_at,
-               CASE WHEN ${full}::boolean THEN t.created_at END AS created_at,
-               CASE WHEN ${full}::boolean THEN t.updated_at END AS updated_at,
-               p.id AS project_id, p.name AS project_name,
-               m.id AS milestone_id, m.name AS milestone_name,
+               -- Ids come from the task's OWN spine columns, which are always
+               -- visible with the task. The joined NAMES stay subject to RLS on
+               -- projects/milestones/contacts: a developer assigned to a task
+               -- but not a member of its project sees the ids with null names.
+               t.project_id, p.name AS project_name,
+               t.milestone_id, m.name AS milestone_name,
                c.full_name AS client_name,
                COALESCE((
                  SELECT jsonb_agg(jsonb_build_object('user_id', u.id, 'name', u.full_name))
