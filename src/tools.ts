@@ -19,6 +19,7 @@ import {
   NEVER_RETURN_FIELDS,
   archiveAllowed,
   can,
+  describeFor,
   doneRule,
   isToolAllowed,
   recordAllowed,
@@ -333,10 +334,12 @@ export function registerTools(
   // wrapper: a tool the role may not use is never registered, so tools/list only
   // shows what the caller can use. The handler is ALSO wrapped so the role is
   // re-checked on every call (defence in depth), before any argument handling.
+  // The description gets this role's limits appended (permissions.ts), so the
+  // caller's AI knows them up front.
   const server: ToolServer = {
     tool: (name, description, schema, handler) => {
       if (!isToolAllowed(role, name)) return;
-      mcpServer.tool(name, description, schema, async (args) =>
+      mcpServer.tool(name, describeFor(role, name, description), schema, async (args) =>
         isToolAllowed(role, name)
           ? handler(args)
           : fail(`Your role (${role}) is not allowed to use ${name}.`),

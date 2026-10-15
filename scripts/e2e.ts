@@ -273,6 +273,25 @@ async function s1Visibility() {
     check(S, `${role} sees exactly its permissions.ts tools`, r.status === 200 && same && names.length === EXPECTED[role],
       `${names.length}/${EXPECTED[role]}${same ? '' : ` extra=[${names.filter((n) => !want.includes(n as any))}] missing=[${want.filter((n) => !names.includes(n))}]`}`);
   }
+  // Role-aware descriptions + server instructions
+  const toolDesc = async (u: User, tool: string) => {
+    const r = await rpc(u.token, 'tools/list');
+    return (r.body?.result?.tools ?? []).find((t: any) => t.name === tool)?.description as string | undefined;
+  };
+  const devCreate = await toolDesc(dev, 'create_task');
+  check(S, 'developer create_task description states the self-assign limit', !!devCreate?.includes('You can only create tasks assigned to yourself.'), short(devCreate?.split('\n\n').pop(), 160));
+  const adminCreate = await toolDesc(admin, 'create_task');
+  check(S, 'admin create_task description has no self-assign/management/status limit', !!adminCreate && !/assigned to yourself|management tasks|You can only set/.test(adminCreate), short(adminCreate?.split('\n\n').pop(), 160));
+  if (sa) {
+    const saCreate = await toolDesc(sa, 'create_task');
+    check(S, 'super_admin create_task description has no limit sentence at all', !!saCreate && !saCreate.includes('Limits for your role'), '');
+  }
+  for (const u of [dev, admin]) {
+    const init = await rpc(u.token, 'initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
+    const ins: string = init.body?.result?.instructions ?? '';
+    check(S, `initialize instructions name the ${u.role} and their role`, ins.includes(`as ${u.full_name} (role: ${u.role})`) && ins.includes('Never claim another role'), short(ins, 120));
+  }
+
   if (users.internal) {
     const r = await rpc(users.internal.token, 'tools/list');
     check(S, 'M1 internal sign-in refused with 403 + message', r.status === 403 && /Your role \(internal\) does not have MCP access yet/.test(JSON.stringify(r.body)), `HTTP ${r.status} ${short(JSON.stringify(r.body))}`);

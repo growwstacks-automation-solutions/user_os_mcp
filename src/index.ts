@@ -13,6 +13,7 @@ import { createMcpHandler } from 'mcp-handler';
 
 import { AuthError, authenticate, issuer } from './auth';
 import type { Env } from './db';
+import { serverInstructions } from './permissions';
 import { registerTools } from './tools';
 import { MAX_FILE_BYTES, storeAttachment, validateContent, verifyUpload } from './uploads';
 
@@ -213,10 +214,12 @@ export default {
     }
 
     // The handler is built per request: Workers only expose `env` here, and the
-    // tools must be bound to THIS caller's identity.
+    // tools must be bound to THIS caller's identity. `instructions` (MCP SDK
+    // ServerOptions, returned in the initialize response) tells the caller's AI
+    // who is signed in and that only the listed tools are available.
     const handler = createMcpHandler(
       (server) => registerTools(server as never, env, origin, identity),
-      {},
+      { instructions: serverInstructions(identity.name, identity.role) },
       { basePath: '' },
     );
 

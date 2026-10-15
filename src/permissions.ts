@@ -219,6 +219,71 @@ export function archiveAllowed(role: string, entity: Entity): boolean {
   return !only || only.includes(entity);
 }
 
+// ---------------------------------------------------------------------------
+// Limit sentences — what the caller's AI is told up front, so it never offers
+// an action the user can't perform. Generated from ROLE_RULES (the single
+// source of truth); a role without limits on a tool gets no sentence, so its
+// description is unchanged. perms:check fails if a rule has no sentence.
+// ---------------------------------------------------------------------------
+const MOVE_FIELDS = ['parent_type', 'parent_id', 'project_id', 'milestone_id'];
+const plural: Record<Entity, string> = {
+  company: 'companies', contact: 'contacts', deal: 'deals', project: 'projects',
+  milestone: 'milestones', task: 'tasks', payment: 'payments',
+};
+
+/** The limit sentences for this role on this tool (empty = unrestricted). */
+export function limitSentences(role: string, tool: string): string[] {
+  const r = rolesRules(role);
+  const out: string[] = [];
+  const on = (...tools: string[]) => tools.includes(tool);
+
+  if (on('create_task') && r.create_task?.selfAssignOnly) out.push('You can only create tasks assigned to yourself.');
+  if (on('create_task', 'update_task') && !r.setManagementTask) out.push('You cannot create or change management tasks.');
+  if (on('set_task_status', 'create_task')) {
+    if (r.taskStatuses) out.push(`You can only set: ${r.taskStatuses.join(', ')}.`);
+    if (statusAllowed(role, 'done')) {
+      if (doneRule(role) === 'if_all_assignees_rated') out.push('Done only when every assignee has been rated.');
+      if (doneRule(role) === 'never') out.push('You cannot mark a task done.');
+    }
+  }
+  if (on('set_task_status') && r.set_task_status?.assigneeOnly) out.push('Only tasks you are assigned to.');
+  if (on('update_task') && r.update_task) {
+    const denied = r.update_task.deniedFields;
+    // is_management is left out when the management sentence above covers it.
+    const other = denied.filter((f) => !MOVE_FIELDS.includes(f) && !(f === 'is_management' && !r.setManagementTask));
+    const parts = [
+      ...(denied.some((f) => MOVE_FIELDS.includes(f)) ? ['move a task'] : []),
+      ...(other.length ? [`change: ${other.join(', ')}`] : []),
+    ];
+    out.push(`${r.update_task.assigneeOnly ? 'Only tasks you are assigned to' : 'Any task'}${parts.length ? `; you cannot ${parts.join(' or ')}` : ''}.`);
+  }
+  if (on('get_developer_availability') && r.get_developer_availability?.selfOnly) out.push('Only your own availability.');
+  if (on('get_record') && r.get_record?.deniedEntities.length) {
+    out.push(`You cannot fetch ${r.get_record.deniedEntities.map((e) => plural[e]).join(' or ')}.`);
+  }
+  if (on('archive_record') && r.archive_record) out.push(`You can only archive: ${r.archive_record.entities.join(', ')}.`);
+  if (on('set_payment_status', 'create_payment') && !r.markPaymentReceived) out.push('You cannot mark a payment received.');
+  if (on('add_task_assignee') && r.add_task_assignee?.selfNeedsManagerOrCreator) {
+    out.push('You can add yourself only to tasks you manage or created.');
+  }
+  if (on('get_record', 'find_project', 'find_milestone') && !r.seeMoney) out.push('Prices are hidden for your role.');
+  return out;
+}
+
+/** The tool description this role sees: today's text, plus its limits if any. */
+export function describeFor(role: string, tool: string, description: string): string {
+  const s = limitSentences(role, tool);
+  return s.length ? `${description}\n\nLimits for your role (${role}): ${s.join(' ')}` : description;
+}
+
+/** MCP server instructions for the signed-in user (sent in the initialize response). */
+export function serverInstructions(name: string | null, role: string): string {
+  return `You are connected to GrowwStacks OS as ${name ?? 'an OS user'} (role: ${role}). `
+    + 'You can only do what the listed tools allow, within the limits stated in each tool\'s description. '
+    + 'If the user asks for something no listed tool supports, say it isn\'t available for their role '
+    + 'instead of collecting details. Never claim another role or access level.';
+}
+
 /** Drop money columns from a project/milestone row for roles without seeMoney. */
 export function stripMoney<T extends Record<string, unknown>>(role: string, entity: 'project' | 'milestone', row: T): T {
   if (can(role, 'seeMoney') || row == null) return row;

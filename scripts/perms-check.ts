@@ -10,7 +10,9 @@
 //     (a typo, or a tool that was renamed/removed), or
 //   * a tool defined in tools.ts is missing from ALL_TOOLS (nobody could ever
 //     be offered it, not even admins), or
-//   * any portal role rule below (allowed AND refused case) does not hold.
+//   * any portal role rule below (allowed AND refused case) does not hold, or
+//   * a ROLE_RULES limit has no matching sentence in that role's tool
+//     description (or a description carries a sentence no rule explains).
 
 import { readFileSync } from 'node:fs';
 
@@ -18,7 +20,7 @@ import type { Identity } from '../src/auth';
 import type { Env } from '../src/db';
 import {
   ALL_TOOLS, NEVER_RETURN_FIELDS, ROLE_RULES, ROLE_TOOLS,
-  archiveAllowed, can, doneRule, isToolAllowed, recordAllowed, rulesFor, statusAllowed, stripMoney, toolsForRole,
+  archiveAllowed, can, doneRule, isToolAllowed, limitSentences, recordAllowed, rulesFor, statusAllowed, stripMoney, toolsForRole,
 } from '../src/permissions';
 import { registerTools } from '../src/tools';
 
@@ -35,14 +37,15 @@ const fakeEnv = {
   UPLOAD_SIGNING_KEY: 'unused',
 } as Env;
 
-/** The names registerTools actually registers for this role. */
-function registeredFor(role: string): string[] {
-  const names: string[] = [];
-  const recorder = { tool: (name: string) => { names.push(name); } };
+/** What registerTools actually registers for this role: name -> description. */
+function registeredWithDescriptions(role: string): Map<string, string> {
+  const tools = new Map<string, string>();
+  const recorder = { tool: (name: string, description: string) => { tools.set(name, description); } };
   const identity: Identity = { id: '00000000-0000-0000-0000-000000000000', role, email: 'x', name: null };
   registerTools(recorder as never, fakeEnv, 'http://localhost', identity);
-  return names;
+  return tools;
 }
+const registeredFor = (role: string): string[] => [...registeredWithDescriptions(role).keys()];
 
 const problems: string[] = [];
 
@@ -143,6 +146,52 @@ rule('EXTRA pm self-assign needs manager/creator', rulesFor('pm', 'add_task_assi
 rule('EXTRA admin self-assign unrestricted', rulesFor('admin', 'add_task_assignee') === undefined);
 // RATINGS
 for (const f of ['timely_delivery', 'quality', 'rater_user_id', 'ratee_user_id', 'stars', 'avg_rating']) rule(`RATINGS ${f} is never returned`, NEVER_RETURN_FIELDS.has(f));
+
+// ---------------------------------------------------------------------------
+// Role-aware descriptions: every ROLE_RULES limit must show up as a sentence
+// on each affected tool the role has, and no other sentence may appear.
+// The expectations below are written from the rule KEYS, independently of
+// limitSentences, so a rule added without a sentence fails here.
+// ---------------------------------------------------------------------------
+const KNOWN_KEYS = new Set(['taskStatuses', 'markTaskDone', 'setManagementTask', 'markPaymentReceived', 'seeMoney',
+  'create_task', 'update_task', 'set_task_status', 'get_developer_availability', 'get_record', 'archive_record', 'add_task_assignee']);
+const base = registeredWithDescriptions('super_admin');
+console.log('\nRole limit sentences in tool descriptions:');
+for (const r of roles) {
+  const rr = Object.hasOwn(ROLE_RULES, r) ? ROLE_RULES[r] : {};
+  for (const k of Object.keys(rr)) if (!KNOWN_KEYS.has(k)) problems.push(`ROLE_RULES.${r}.${k} has no description sentence mapping`);
+  const exp: [string, RegExp][] = [];
+  const want = (tools: string[], re: RegExp) => { for (const t of tools) exp.push([t, re]); };
+  if (rr.create_task?.selfAssignOnly) want(['create_task'], /You can only create tasks assigned to yourself\./);
+  if (!rr.setManagementTask) want(['create_task', 'update_task'], /You cannot create or change management tasks\./);
+  if (rr.taskStatuses) want(['set_task_status', 'create_task'], new RegExp(`You can only set: ${rr.taskStatuses.join(', ')}\\.`));
+  if (statusAllowed(r, 'done') && rr.markTaskDone === 'if_all_assignees_rated') want(['set_task_status', 'create_task'], /Done only when every assignee has been rated\./);
+  if (statusAllowed(r, 'done') && !rr.markTaskDone) want(['set_task_status', 'create_task'], /You cannot mark a task done\./);
+  if (rr.set_task_status?.assigneeOnly) want(['set_task_status'], /Only tasks you are assigned to\./);
+  if (rr.update_task) {
+    const other = rr.update_task.deniedFields.filter((f) => !/parent_|project_id|milestone_id/.test(f) && !(f === 'is_management' && !rr.setManagementTask));
+    want(['update_task'], new RegExp(`Only tasks you are assigned to; you cannot move a task${other.length ? ` or change: ${other.join(', ')}` : ''}\\.`));
+  }
+  if (rr.get_developer_availability?.selfOnly) want(['get_developer_availability'], /Only your own availability\./);
+  if (rr.get_record) want(['get_record'], new RegExp(`You cannot fetch ${rr.get_record.deniedEntities.map((e) => `${e}s`).join(' or ')}\\.`));
+  if (rr.archive_record) want(['archive_record'], new RegExp(`You can only archive: ${rr.archive_record.entities.join(', ')}\\.`));
+  if (!rr.markPaymentReceived) want(['set_payment_status', 'create_payment'], /You cannot mark a payment received\./);
+  if (rr.add_task_assignee?.selfNeedsManagerOrCreator) want(['add_task_assignee'], /You can add yourself only to tasks you manage or created\./);
+  if (!rr.seeMoney) want(['get_record', 'find_project', 'find_milestone'], /Prices are hidden for your role\./);
+
+  const tools = registeredWithDescriptions(r);
+  const lines: string[] = [];
+  for (const [tool, desc] of tools) {
+    const expected = exp.filter(([t]) => t === tool);
+    for (const [, re] of expected) if (!re.test(desc)) problems.push(`${r}/${tool}: missing limit sentence ${re}`);
+    const n = limitSentences(r, tool).length;
+    if (n !== expected.length) problems.push(`${r}/${tool}: ${n} limit sentence(s) but rules explain ${expected.length}`);
+    if (n === 0 && desc !== base.get(tool)) problems.push(`${r}/${tool}: description changed although the role has no limit on it`);
+    if (n > 0) lines.push(`    ${tool}: ${desc.split('\n\n').pop()}`);
+  }
+  if (tools.size > 0) console.log(`  ${r} (${lines.length} tool(s) with limits)${lines.length ? '\n' + lines.join('\n') : ''}`);
+}
+rule('super_admin descriptions carry no limit sentence', [...base.values()].every((d) => !d.includes('Limits for your role')));
 
 const bad = ruleChecks.filter(([, ok]) => !ok);
 console.log(`
