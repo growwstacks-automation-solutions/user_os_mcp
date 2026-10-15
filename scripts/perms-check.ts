@@ -12,14 +12,18 @@
 //     be offered it, not even admins), or
 //   * any portal role rule below (allowed AND refused case) does not hold, or
 //   * a ROLE_RULES limit has no matching sentence in that role's tool
-//     description (or a description carries a sentence no rule explains).
+//     description (or a description carries a sentence no rule explains), or
+//   * a role's input schema differs from the unrestricted one in any way its
+//     rules do not explain (hidden fields, narrowed enums).
 
 import { readFileSync } from 'node:fs';
+import { z } from 'zod';
+import { toJsonSchemaCompat } from '@modelcontextprotocol/sdk/server/zod-json-schema-compat.js';
 
 import type { Identity } from '../src/auth';
 import type { Env } from '../src/db';
 import {
-  ALL_TOOLS, NEVER_RETURN_FIELDS, ROLE_RULES, ROLE_TOOLS,
+  ALL_TOOLS, NEVER_RETURN_FIELDS, ROLE_RULES, ROLE_TOOLS, SELF_ASSIGN_LEAD,
   archiveAllowed, can, doneRule, isToolAllowed, limitSentences, recordAllowed, rulesFor, statusAllowed, stripMoney, toolsForRole,
 } from '../src/permissions';
 import { registerTools } from '../src/tools';
@@ -37,15 +41,37 @@ const fakeEnv = {
   UPLOAD_SIGNING_KEY: 'unused',
 } as Env;
 
-/** What registerTools actually registers for this role: name -> description. */
-function registeredWithDescriptions(role: string): Map<string, string> {
-  const tools = new Map<string, string>();
-  const recorder = { tool: (name: string, description: string) => { tools.set(name, description); } };
+type Registered = { description: string; schema: Record<string, z.ZodTypeAny>; object?: z.ZodObject<any> };
+/** What registerTools actually registers for this role: name -> description + input schema. */
+function registered(role: string): Map<string, Registered> {
+  const tools = new Map<string, Registered>();
+  const recorder = {
+    tool: (name: string, description: string, schema: Record<string, z.ZodTypeAny>) => { tools.set(name, { description, schema }); },
+    registerTool: (name: string, cfg: { description: string; inputSchema: z.ZodObject<any> }) => {
+      tools.set(name, { description: cfg.description, schema: cfg.inputSchema.shape, object: cfg.inputSchema });
+    },
+  };
   const identity: Identity = { id: '00000000-0000-0000-0000-000000000000', role, email: 'x', name: null };
   registerTools(recorder as never, fakeEnv, 'http://localhost', identity);
   return tools;
 }
-const registeredFor = (role: string): string[] => [...registeredWithDescriptions(role).keys()];
+const registeredWithDescriptions = (role: string): Map<string, string> =>
+  new Map([...registered(role)].map(([n, r]) => [n, r.description]));
+const registeredFor = (role: string): string[] => [...registered(role).keys()];
+
+/** The enum values a field accepts (plain enum, or enum | "skip"); null if not an enum. */
+function enumOf(t: z.ZodTypeAny | undefined): string[] | null {
+  if (t instanceof z.ZodDefault) return enumOf(t._def.innerType);
+  if (t instanceof z.ZodEnum) return [...t.options];
+  if (t instanceof z.ZodUnion) for (const o of t.options as z.ZodTypeAny[]) if (o instanceof z.ZodEnum) return [...o.options];
+  return null;
+}
+
+/** The JSON Schema clients see for each field (same converter and options as tools/list). */
+function jsonProps(schema: Record<string, z.ZodTypeAny>): Record<string, string> {
+  const js = toJsonSchemaCompat(z.object(schema) as never, { strictUnions: true, pipeStrategy: 'input' }) as { properties?: Record<string, unknown> };
+  return Object.fromEntries(Object.entries(js.properties ?? {}).map(([k, v]) => [k, JSON.stringify(v)]));
+}
 
 const problems: string[] = [];
 
@@ -162,7 +188,8 @@ for (const r of roles) {
   for (const k of Object.keys(rr)) if (!KNOWN_KEYS.has(k)) problems.push(`ROLE_RULES.${r}.${k} has no description sentence mapping`);
   const exp: [string, RegExp][] = [];
   const want = (tools: string[], re: RegExp) => { for (const t of tools) exp.push([t, re]); };
-  if (rr.create_task?.selfAssignOnly) want(['create_task'], /You can only create tasks assigned to yourself\./);
+  if (rr.create_task?.selfAssignOnly) want(['create_task'], /^You can only create tasks for yourself\. If the user asks to create a task for anyone else, refuse immediately and do not ask for any details\. The task is always assigned to you\./);
+  if (rr.create_task?.parentTypes) want(['create_task'], new RegExp(`Tasks can only be created under: ${rr.create_task.parentTypes.join(', ')}\\.`));
   if (!rr.setManagementTask) want(['create_task', 'update_task'], /You cannot create or change management tasks\./);
   if (rr.taskStatuses) want(['set_task_status', 'create_task'], new RegExp(`You can only set: ${rr.taskStatuses.join(', ')}\\.`));
   if (statusAllowed(r, 'done') && rr.markTaskDone === 'if_all_assignees_rated') want(['set_task_status', 'create_task'], /Done only when every assignee has been rated\./);
@@ -187,11 +214,65 @@ for (const r of roles) {
     const n = limitSentences(r, tool).length;
     if (n !== expected.length) problems.push(`${r}/${tool}: ${n} limit sentence(s) but rules explain ${expected.length}`);
     if (n === 0 && desc !== base.get(tool)) problems.push(`${r}/${tool}: description changed although the role has no limit on it`);
-    if (n > 0) lines.push(`    ${tool}: ${desc.split('\n\n').pop()}`);
+    if (n > 0 && !desc.startsWith(`Limits for your role (${r}): `) && !desc.startsWith(SELF_ASSIGN_LEAD)) problems.push(`${r}/${tool}: limits are not at the start of the description`);
+    if (n > 0 && !desc.endsWith(base.get(tool)!)) problems.push(`${r}/${tool}: normal description not kept after the limits`);
+    if (n > 0) lines.push(`    ${tool}: ${desc.slice(0, desc.length - base.get(tool)!.length).trim().replace(/\n\n/g, ' | ')}`);
   }
   if (tools.size > 0) console.log(`  ${r} (${lines.length} tool(s) with limits)${lines.length ? '\n' + lines.join('\n') : ''}`);
 }
 rule('super_admin descriptions carry no limit sentence', [...base.values()].every((d) => !d.includes('Limits for your role')));
+
+// ---------------------------------------------------------------------------
+// Input schemas per role. Expectations come from the ROLE_RULES keys; every
+// other field must be exactly the unrestricted (super_admin) field.
+// ---------------------------------------------------------------------------
+const baseSchemas = registered('super_admin');
+const ALL_ENTITIES = enumOf(baseSchemas.get('get_record')!.schema.entity)!;
+console.log('\nInput-schema changes per role (vs. the unrestricted schema):');
+for (const r of roles) {
+  const rr = Object.hasOwn(ROLE_RULES, r) ? ROLE_RULES[r] : {};
+  const hide = new Map<string, Set<string>>();   // tool -> hidden fields
+  const enums = new Map<string, Map<string, readonly string[]>>(); // tool -> field -> values
+  const h = (tool: string, f: string) => { if (!hide.has(tool)) hide.set(tool, new Set()); hide.get(tool)!.add(f); };
+  const en = (tool: string, f: string, v: readonly string[]) => { if (!enums.has(tool)) enums.set(tool, new Map()); enums.get(tool)!.set(f, v); };
+  if (rr.create_task?.selfAssignOnly) h('create_task', 'assignee_ids');
+  if (rr.create_task?.parentTypes) en('create_task', 'parent_type', rr.create_task.parentTypes);
+  if (!rr.setManagementTask) { h('create_task', 'is_management'); h('update_task', 'is_management'); }
+  if (rr.taskStatuses) { en('create_task', 'status', rr.taskStatuses); en('set_task_status', 'status', rr.taskStatuses); }
+  if (rr.get_developer_availability?.selfOnly) h('get_developer_availability', 'user_id');
+  if (rr.get_record) en('get_record', 'entity', ALL_ENTITIES.filter((e) => !rr.get_record!.deniedEntities.includes(e as never)));
+  if (rr.archive_record) en('archive_record', 'entity', rr.archive_record.entities);
+
+  const changes: string[] = [];
+  for (const [tool, reg] of registered(r)) {
+    const want = baseSchemas.get(tool)!.schema;
+    const got = reg.schema;
+    const wantJs = jsonProps(want), gotJs = jsonProps(got);
+    for (const f of Object.keys(want)) {
+      const hidden = hide.get(tool)?.has(f) ?? false;
+      const narrowed = enums.get(tool)?.get(f);
+      if (hidden) {
+        if (f in got) problems.push(`${r}/${tool}: field ${f} should be hidden`);
+        else changes.push(`${tool}: removed ${f}`);
+        // Sending it anyway must be refused by the schema with a clear message.
+        const res = reg.object?.safeParse({ [f]: 'probe' });
+        const msg = res && !res.success ? res.error.issues.map((i) => i.message).join(' ') : '';
+        if (!msg.includes(`${f} is not allowed`)) problems.push(`${r}/${tool}: sending hidden ${f} is not refused with a clear message (${msg || 'accepted'})`);
+        else changes.push(`${tool}: sending ${f} -> refused: "${res!.error!.issues.find((i) => i.message.includes(f))!.message}"`);
+      } else if (narrowed) {
+        const vals = enumOf(got[f]);
+        if (!vals || vals.join(',') !== [...narrowed].join(',')) problems.push(`${r}/${tool}: ${f} should allow only [${narrowed}] (got ${vals})`);
+        else changes.push(`${tool}: ${f} narrowed to ${vals.join(' | ')}`);
+      } else if (gotJs[f] !== wantJs[f]) {
+        problems.push(`${r}/${tool}: field ${f} changed although no rule limits it`);
+      }
+    }
+    for (const f of Object.keys(got)) if (!(f in want)) problems.push(`${r}/${tool}: unexpected extra field ${f}`);
+  }
+  if (registered(r).size > 0) console.log(`  ${r}: ${changes.length ? '\n    ' + changes.join('\n    ') : '(unchanged)'}`);
+}
+rule('admin input schemas are identical to super_admin', [...registered('admin')].every(([t, reg]) =>
+  JSON.stringify(jsonProps(reg.schema)) === JSON.stringify(jsonProps(baseSchemas.get(t)!.schema))));
 
 const bad = ruleChecks.filter(([, ok]) => !ok);
 console.log(`

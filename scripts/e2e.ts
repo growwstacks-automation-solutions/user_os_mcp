@@ -279,9 +279,51 @@ async function s1Visibility() {
     return (r.body?.result?.tools ?? []).find((t: any) => t.name === tool)?.description as string | undefined;
   };
   const devCreate = await toolDesc(dev, 'create_task');
-  check(S, 'developer create_task description states the self-assign limit', !!devCreate?.includes('You can only create tasks assigned to yourself.'), short(devCreate?.split('\n\n').pop(), 160));
+  check(S, 'developer create_task description STARTS with the exact self-assign text', !!devCreate?.startsWith('You can only create tasks for yourself. If the user asks to create a task for anyone else, refuse immediately and do not ask for any details. The task is always assigned to you.'), short(devCreate?.split('\n\n')[0], 160));
   const adminCreate = await toolDesc(admin, 'create_task');
-  check(S, 'admin create_task description has no self-assign/management/status limit', !!adminCreate && !/assigned to yourself|management tasks|You can only set/.test(adminCreate), short(adminCreate?.split('\n\n').pop(), 160));
+  check(S, 'admin create_task description has no self-assign/management/status limit', !!adminCreate && !/assigned to you|management tasks|You can only set/.test(adminCreate), short(adminCreate?.split('\n\n')[0], 160));
+
+  // Input schemas per role (tools/list inputSchema)
+  const toolSchema = async (u: User, tool: string) => {
+    const r = await rpc(u.token, 'tools/list');
+    return (r.body?.result?.tools ?? []).find((t: any) => t.name === tool)?.inputSchema?.properties ?? {};
+  };
+  const enumIn = (p: any): string[] | null => p?.enum ?? p?.anyOf?.find((x: any) => Array.isArray(x.enum) && !x.enum.includes('skip'))?.enum ?? p?.anyOf?.find((x: any) => Array.isArray(x.enum))?.enum ?? null;
+  const dc = await toolSchema(dev, 'create_task');
+  check(S, 'developer create_task schema: no assignee_ids, no is_management', !('assignee_ids' in dc) && !('is_management' in dc), Object.keys(dc).join(','));
+  check(S, 'developer create_task schema: status = todo | in_progress | qa_review (+ skip)', JSON.stringify(enumIn(dc.status)) === '["todo","in_progress","qa_review"]', JSON.stringify(dc.status).slice(0, 120));
+  check(S, 'developer create_task schema: parent_type = milestone only', JSON.stringify(enumIn(dc.parent_type)) === '["milestone"]', JSON.stringify(dc.parent_type));
+  const ds = await toolSchema(dev, 'set_task_status');
+  check(S, 'developer set_task_status schema: status = todo | in_progress | qa_review', JSON.stringify(enumIn(ds.status)) === '["todo","in_progress","qa_review"]', JSON.stringify(ds.status));
+  const du = await toolSchema(dev, 'update_task');
+  check(S, 'developer update_task schema: no is_management', !('is_management' in du) && 'title' in du, '');
+  const da = await toolSchema(dev, 'get_developer_availability');
+  check(S, 'developer get_developer_availability schema: no user_id', !('user_id' in da) && 'date_from' in da, Object.keys(da).join(','));
+  const dg = await toolSchema(dev, 'get_record');
+  check(S, 'developer get_record schema: entity excludes deal and payment', JSON.stringify(enumIn(dg.entity)) === '["company","contact","project","milestone","task"]', JSON.stringify(enumIn(dg.entity)));
+  if (ops) {
+    const oc = await toolSchema(ops, 'create_task');
+    check(S, 'operations create_task schema: no assignee_ids, no is_management', !('assignee_ids' in oc) && !('is_management' in oc), '');
+  }
+  if (sales) {
+    const sa1 = await toolSchema(sales, 'archive_record');
+    check(S, 'sales archive_record schema: entity = deal only', JSON.stringify(enumIn(sa1.entity)) === '["deal"]', JSON.stringify(enumIn(sa1.entity)));
+    const sg = await toolSchema(sales, 'get_record');
+    check(S, 'sales get_record schema: entity excludes payment', !enumIn(sg.entity)?.includes('payment') && !!enumIn(sg.entity)?.includes('deal'), JSON.stringify(enumIn(sg.entity)));
+  }
+  if (pm) {
+    const pc = await toolSchema(pm, 'create_task');
+    const pu = await toolSchema(pm, 'update_task');
+    check(S, 'pm create_task/update_task schema: is_management removed, assignee_ids kept', 'assignee_ids' in pc && !('is_management' in pc) && !('is_management' in pu), '');
+  }
+  const ac = await toolSchema(admin, 'create_task');
+  const au = await toolSchema(admin, 'update_task');
+  check(S, 'admin create_task/update_task schema unchanged (assignee_ids + is_management present)', 'assignee_ids' in ac && 'is_management' in ac && 'is_management' in au && enumIn(ac.status) === null, '');
+  if (sa) {
+    const [la, ls] = await Promise.all([rpc(admin.token, 'tools/list'), rpc(sa.token, 'tools/list')]);
+    const schemas = (b: any) => JSON.stringify((b.body?.result?.tools ?? []).map((t: any) => [t.name, t.inputSchema]).sort());
+    check(S, 'admin input schemas are identical to super_admin', schemas(la) === schemas(ls), '');
+  }
   if (sa) {
     const saCreate = await toolDesc(sa, 'create_task');
     check(S, 'super_admin create_task description has no limit sentence at all', !!saCreate && !saCreate.includes('Limits for your role'), '');
@@ -289,7 +331,7 @@ async function s1Visibility() {
   for (const u of [dev, admin]) {
     const init = await rpc(u.token, 'initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
     const ins: string = init.body?.result?.instructions ?? '';
-    check(S, `initialize instructions name the ${u.role} and their role`, ins.includes(`as ${u.full_name} (role: ${u.role})`) && ins.includes('Never claim another role'), short(ins, 120));
+    check(S, `initialize instructions name the ${u.role} and their role, and say refuse-in-one-sentence`, ins.includes(`as ${u.full_name} (role: ${u.role})`) && ins.includes('Never claim another role') && ins.includes('refuse in one sentence and do not collect any details for it'), short(ins, 120));
   }
 
   if (users.internal) {
@@ -510,7 +552,11 @@ async function s4DeveloperRules() {
   const f2 = await call(dev, 'update_task', { task_id: ids.taskA, clear_fields: ['details'] });
   check(S, 'D2 update_task clearing a field on assigned task works', f2.ok, f2.ok ? '' : short(f2.error, 110));
   const f3 = await call(dev, 'update_task', { task_id: ids.taskA, is_management: true });
-  check(S, 'D2/M6 developer update_task is_management refused', !f3.ok && /cannot change: is_management/.test(f3.error ?? ''), short(f3.error, 110));
+  const f3r = await call(admin, 'get_record', { entity: 'task', id: ids.taskA });
+  check(S, 'D2/M6 developer update_task sending is_management refused, nothing written', !f3.ok && /is_management is not allowed/.test(f3.error ?? '') && f3r.data?.is_management === false, short(f3.error, 110));
+  const f4 = await call(dev, 'update_task', { task_id: ids.taskA, title: `${PREFIX} should not be saved`, is_management: false });
+  const f4r = await call(admin, 'get_record', { entity: 'task', id: ids.taskA });
+  check(S, 'D2/M6 developer update_task with is_management + a real field: whole call refused, title unchanged', !f4.ok && /is_management is not allowed/.test(f4.error ?? '') && f4r.data?.title === newTitle, short(f4.error, 110));
   const nb = await call(dev, 'update_task', { task_id: ids.taskB, loom_url: 'https://example.com/mcp-test-b' });
   check(S, 'update_task on a task NOT assigned to the developer refused', !nb.ok && /assigned to/.test(nb.error ?? ''), short(nb.error, 90));
   const ok = await call(dev, 'update_task', { task_id: ids.taskA, loom_url: 'https://example.com/mcp-test', time_reported_hours: 1.5 });
@@ -525,14 +571,14 @@ async function s4DeveloperRules() {
   check(S, 'M2 developer set_task_status qa_review works', sq.ok && sq.data.status === 'qa_review', sq.ok ? '' : short(sq.error));
   for (const st of ['done', 'stuck']) {
     const r = await call(dev, 'set_task_status', { task_id: ids.taskA, status: st });
-    check(S, `M2 developer set_task_status ${st} refused`, !r.ok && /can only set these statuses/.test(r.error ?? ''), short(r.error, 100));
+    check(S, `M2 developer set_task_status ${st} refused (not in their schema)`, !r.ok, short(r.error, 100));
   }
   const sx = await call(dev, 'set_task_status', { task_id: ids.taskB, status: 'in_progress' });
   check(S, 'set_task_status on another task refused', !sx.ok, short(sx.error, 90));
   const today = new Date().toISOString().slice(0, 10);
   const week = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
   const av1 = await call(dev, 'get_developer_availability', { date_from: today, date_to: week, user_id: otherDev?.id ?? admin.id });
-  check(S, 'get_developer_availability for another user refused', !av1.ok && /own availability/.test(av1.error ?? ''), short(av1.error, 90));
+  check(S, 'get_developer_availability sending user_id refused', !av1.ok && /user_id is not allowed/.test(av1.error ?? ''), short(av1.error, 110));
   const av2 = await call(dev, 'get_developer_availability', { date_from: today, date_to: week });
   check(S, 'get_developer_availability without user_id returns only self', av2.ok && av2.data.length <= 1 && av2.data.every((d: any) => d.user_id === dev.id), av2.ok ? `entries=${av2.data.length}` : short(av2.error));
   const lt = await call(dev, 'list_tasks', { search: PREFIX, limit: 50 });
@@ -606,26 +652,35 @@ async function s9Portal() {
   const other = otherDev?.id ?? admin.id;
 
   // D1 + M2 + M6 — developer create_task
-  const d1 = await call(dev, 'create_task', { ...base, title: `${PREFIX} Task (developer self)`, status: 'skip', manager_ids: [dev.id], assignee_ids: [dev.id] });
-  check(S, 'D1 developer create_task assigned to self works', d1.ok, d1.ok ? d1.data.display_id : short(d1.error));
+  const d1 = await call(dev, 'create_task', { ...base, title: `${PREFIX} Task (developer self)`, status: 'skip', manager_ids: [dev.id] });
+  check(S, 'D1 developer create_task (no assignee_ids) is assigned to self', d1.ok && d1.data.assignees?.length === 1 && d1.data.assignees[0].user_id === dev.id, d1.ok ? d1.data.display_id : short(d1.error));
   if (d1.ok) {
     created('task', d1.data.id, dev); ids.devTask = d1.data.id;
     manifest.joins.push({ kind: 'task_manager', a: d1.data.id, b: dev.id }, { kind: 'task_assignee', a: d1.data.id, b: dev.id }); saveManifest();
     check(S, 'D1 ...created_by = developer, is_management false', d1.data.created_by === dev.id && d1.data.is_management === false, `${d1.data.created_by} mgmt=${d1.data.is_management}`);
   }
-  for (const [label, assignees] of [['another user', [other]], ['"skip" (unassigned)', 'skip'], ['self + another user', [dev.id, other]]] as const) {
-    const r = await call(dev, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: 'skip', assignee_ids: assignees });
-    check(S, `D1 developer create_task assigned to ${label} refused`, !r.ok && /assigned to yourself/.test(r.error ?? ''), short(r.error, 100));
-  }
-  const d2 = await call(dev, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'done', manager_ids: 'skip', assignee_ids: [dev.id] });
-  check(S, 'M2 developer create_task status=done refused', !d2.ok && /can only set these statuses/.test(d2.error ?? ''), short(d2.error, 100));
-  const d3 = await call(dev, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: 'skip', assignee_ids: [dev.id], is_management: true });
-  check(S, 'M6 developer create_task is_management=true refused', !d3.ok && /management task/.test(d3.error ?? ''), short(d3.error, 100));
+  // A client that sends a hidden or disallowed field anyway: the whole call is
+  // refused and nothing is written (checked by title, archived rows included).
+  const nothingWritten = async (title: string) => {
+    const [r] = await readAs<{ n: number }>(SERVICE_UID, (s) => s`SELECT count(*)::int AS n FROM tasks WHERE title = ${title}`);
+    return r.n === 0;
+  };
+  const refusedCreate = async (u: User, label: string, extra: Record<string, unknown>, re: RegExp) => {
+    const title = `${PREFIX} refused ${u.role} ${label}`;
+    const r = await call(u, 'create_task', { ...base, title, status: 'skip', manager_ids: 'skip', ...extra });
+    const none = await nothingWritten(title);
+    check(S, `${u.role} create_task sending ${label}: refused, nothing written`, !r.ok && re.test(r.error ?? '') && none, `${none ? 'nothing written' : 'TASK WAS WRITTEN'}; ${short(r.error, 100)}`);
+  };
+  await refusedCreate(dev, 'assignee_ids (another user)', { assignee_ids: [other] }, /assignee_ids is not allowed/);
+  await refusedCreate(dev, 'assignee_ids (self)', { assignee_ids: [dev.id] }, /assignee_ids is not allowed/);
+  await refusedCreate(dev, 'is_management', { is_management: true }, /is_management is not allowed/);
+  await refusedCreate(dev, 'parent_type=deal', { parent_type: 'deal', parent_id: ids.deal }, /parent_type|milestone/);
+  await refusedCreate(dev, 'status=done', { status: 'done' }, /status/);
 
   // D6 — operations: same tools and rules as developer
   if (ops) {
-    const o1 = await call(ops, 'create_task', { ...base, title: `${PREFIX} Task (operations self)`, status: 'skip', manager_ids: 'skip', assignee_ids: [ops.id] });
-    check(S, 'D6/D1 operations create_task assigned to self works', o1.ok, o1.ok ? o1.data.display_id : short(o1.error));
+    const o1 = await call(ops, 'create_task', { ...base, title: `${PREFIX} Task (operations self)`, status: 'skip', manager_ids: 'skip' });
+    check(S, 'D6/D1 operations create_task (no assignee_ids) is assigned to self', o1.ok && o1.data.assignees?.length === 1 && o1.data.assignees[0].user_id === ops.id, o1.ok ? o1.data.display_id : short(o1.error));
     if (o1.ok) {
       created('task', o1.data.id, ops); ids.opsTask = o1.data.id;
       manifest.joins.push({ kind: 'task_assignee', a: o1.data.id, b: ops.id }); saveManifest();
@@ -635,10 +690,9 @@ async function s9Portal() {
       const oq = await call(ops, 'set_task_status', { task_id: o1.data.id, status: 'qa_review' });
       check(S, 'D6/M2 operations set_task_status qa_review works', oq.ok && oq.data.status === 'qa_review', oq.ok ? '' : short(oq.error));
       const od = await call(ops, 'set_task_status', { task_id: o1.data.id, status: 'done' });
-      check(S, 'D6/M2 operations set_task_status done refused', !od.ok && /can only set these statuses/.test(od.error ?? ''), short(od.error, 100));
+      check(S, 'D6/M2 operations set_task_status done refused (not in their schema)', !od.ok, short(od.error, 100));
     }
-    const o2 = await call(ops, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: 'skip', assignee_ids: [dev.id] });
-    check(S, 'D6/D1 operations create_task assigned to someone else refused', !o2.ok && /assigned to yourself/.test(o2.error ?? ''), short(o2.error, 100));
+    await refusedCreate(ops, 'assignee_ids (U-0068)', { assignee_ids: [dev.id] }, /assignee_ids is not allowed/);
     const o3 = await call(ops, 'update_task', { task_id: ids.taskB, title: `${PREFIX} nope` });
     check(S, 'D6/D2 operations update_task on a task not assigned to them refused', !o3.ok, short(o3.error, 100));
   } else skip(S, 'operations rules', 'no active operations user');
@@ -653,11 +707,11 @@ async function s9Portal() {
     check(S, 'M6 admin update_task is_management=false works', m2.ok && m2.data.task?.is_management === false, m2.ok ? '' : short(m2.error));
   }
   if (pm) {
-    const m3 = await call(pm, 'create_task', { ...base, title: `${PREFIX} should not exist`, status: 'skip', manager_ids: [dev.id], assignee_ids: 'skip', is_management: true });
-    check(S, 'M6 pm create_task is_management=true refused', !m3.ok && /management task/.test(m3.error ?? ''), short(m3.error, 100));
+    await refusedCreate(pm, 'is_management', { is_management: true, manager_ids: [dev.id], assignee_ids: 'skip' }, /is_management is not allowed/);
     if (ids.pmTask) {
       const m4 = await call(pm, 'update_task', { task_id: ids.pmTask, is_management: true });
-      check(S, 'M6 pm update_task is_management refused', !m4.ok && /cannot set or change is_management/.test(m4.error ?? ''), short(m4.error, 100));
+      const m4r = await call(admin, 'get_record', { entity: 'task', id: ids.pmTask });
+      check(S, 'M6 pm update_task sending is_management refused, nothing written', !m4.ok && /is_management is not allowed/.test(m4.error ?? '') && m4r.data?.is_management === false, short(m4.error, 100));
     }
   }
 
@@ -695,9 +749,9 @@ async function s9Portal() {
   // get_record deal / payment
   for (const u of [dev, ops].filter(Boolean) as User[]) {
     const gd = await call(u, 'get_record', { entity: 'deal', id: ids.deal });
-    check(S, `${u.role} get_record deal refused`, !gd.ok && /cannot fetch deal/.test(gd.error ?? ''), short(gd.error, 90));
+    check(S, `${u.role} get_record deal refused (not in their schema)`, !gd.ok, short(gd.error, 90));
     const gp = await call(u, 'get_record', { entity: 'payment', id: ids.payment ?? ids.deal });
-    check(S, `${u.role} get_record payment refused`, !gp.ok && /cannot fetch payment/.test(gp.error ?? ''), short(gp.error, 90));
+    check(S, `${u.role} get_record payment refused (not in their schema)`, !gp.ok, short(gp.error, 90));
   }
   const ga = await call(admin, 'get_record', { entity: 'deal', id: ids.deal });
   check(S, 'admin get_record deal works', ga.ok && ga.data?.id === ids.deal, ga.ok ? '' : short(ga.error));
@@ -705,7 +759,7 @@ async function s9Portal() {
     const gs = await call(sales, 'get_record', { entity: 'deal', id: ids.salesDeal });
     check(S, 'sales get_record deal works (deal_value kept)', gs.ok && gs.data?.id === ids.salesDeal && 'deal_value' in (gs.data ?? {}), gs.ok ? `deal_value=${gs.data?.deal_value}` : short(gs.error));
     const gp = await call(sales, 'get_record', { entity: 'payment', id: ids.payment ?? ids.deal });
-    check(S, 'sales get_record payment refused', !gp.ok && /cannot fetch payment/.test(gp.error ?? ''), short(gp.error, 90));
+    check(S, 'sales get_record payment refused (not in their schema)', !gp.ok, short(gp.error, 90));
   }
 
   // D4 — sales get_credentials (metadata only)
@@ -730,7 +784,8 @@ async function s9Portal() {
   // D3 — sales archive: deals only
   if (sales && ids.salesCompany && ids.salesDeal) {
     const a1 = await call(sales, 'archive_record', { entity: 'company', id: ids.salesCompany, reason: CLEANUP_REASON });
-    check(S, 'D3 sales archive_record company refused', !a1.ok && /cannot archive company/.test(a1.error ?? ''), short(a1.error, 100));
+    const [still] = await readAs(SERVICE_UID, (s) => s`SELECT (archived_at IS NULL) AS live FROM companies WHERE id = ${ids.salesCompany}::uuid`);
+    check(S, 'D3 sales archive_record company refused (not in their schema), company still live', !a1.ok && still?.live === true, short(a1.error, 100));
     const a2 = await call(sales, 'archive_record', { entity: 'deal', id: ids.salesDeal, reason: CLEANUP_REASON });
     check(S, 'D3 sales archive_record deal works', a2.ok && a2.data?.archived === 'deal', a2.ok ? '' : short(a2.error));
   }

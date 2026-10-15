@@ -91,6 +91,8 @@ export type ToolRules = {
   create_task?: {
     /** assignee_ids must be exactly [the caller]. */
     selfAssignOnly: true;
+    /** The only parent_type values this role may create tasks under. */
+    parentTypes?: readonly string[];
   };
   update_task?: {
     /** Only on tasks where the caller is an assignee. */
@@ -122,7 +124,7 @@ export type ToolRules = {
 
 const DELIVERY_RULES: ToolRules = {
   taskStatuses: ['todo', 'in_progress', 'qa_review'],
-  create_task: { selfAssignOnly: true },
+  create_task: { selfAssignOnly: true, parentTypes: ['milestone'] },
   update_task: {
     assigneeOnly: true,
     // Moving a task, and the management flag, stay with admins/pms.
@@ -232,12 +234,17 @@ const plural: Record<Entity, string> = {
 };
 
 /** The limit sentences for this role on this tool (empty = unrestricted). */
+/** Must open the create_task description, verbatim, for selfAssignOnly roles. */
+export const SELF_ASSIGN_LEAD = 'You can only create tasks for yourself. If the user asks to create a task for anyone '
+  + 'else, refuse immediately and do not ask for any details. The task is always assigned to you.';
+
 export function limitSentences(role: string, tool: string): string[] {
   const r = rolesRules(role);
   const out: string[] = [];
   const on = (...tools: string[]) => tools.includes(tool);
 
-  if (on('create_task') && r.create_task?.selfAssignOnly) out.push('You can only create tasks assigned to yourself.');
+  if (on('create_task') && r.create_task?.selfAssignOnly) out.push(SELF_ASSIGN_LEAD);
+  if (on('create_task') && r.create_task?.parentTypes) out.push(`Tasks can only be created under: ${r.create_task.parentTypes.join(', ')}.`);
   if (on('create_task', 'update_task') && !r.setManagementTask) out.push('You cannot create or change management tasks.');
   if (on('set_task_status', 'create_task')) {
     if (r.taskStatuses) out.push(`You can only set: ${r.taskStatuses.join(', ')}.`);
@@ -270,10 +277,58 @@ export function limitSentences(role: string, tool: string): string[] {
   return out;
 }
 
-/** The tool description this role sees: today's text, plus its limits if any. */
+/**
+ * The tool description this role sees: its limits FIRST (if any), then today's
+ * text. SELF_ASSIGN_LEAD, when present, opens the description verbatim.
+ */
 export function describeFor(role: string, tool: string, description: string): string {
   const s = limitSentences(role, tool);
-  return s.length ? `${description}\n\nLimits for your role (${role}): ${s.join(' ')}` : description;
+  if (s.length === 0) return description;
+  const lead = s[0] === SELF_ASSIGN_LEAD ? `${s.shift()}\n\n` : '';
+  return `${lead}${s.length ? `Limits for your role (${role}): ${s.join(' ')}\n\n` : ''}${description}`;
+}
+
+// ---------------------------------------------------------------------------
+// Input-schema limits — where a role cannot use an input field at all, the
+// field is removed from the schema that role sees (or its allowed values are
+// narrowed), instead of only being refused. Generated from ROLE_RULES. A
+// hidden field that the server must still fill is supplied via `inject`.
+// A call that SENDS a hidden field anyway is refused whole (tools.ts registers
+// a strict schema), with the message given here. Nothing is written.
+// The in-tool checks stay as defence in depth.
+// ---------------------------------------------------------------------------
+export type SchemaLimits = {
+  /** Fields removed from the input schema this role sees -> refusal message if sent anyway. */
+  hide: Record<string, string>;
+  /** Fields whose allowed values are narrowed to this list. */
+  enums: Record<string, readonly string[]>;
+  /** Server-side values for hidden fields, always applied to the call. */
+  inject: Record<string, unknown>;
+};
+
+const ENTITIES: readonly Entity[] = ['company', 'contact', 'deal', 'project', 'milestone', 'task', 'payment'];
+
+export function schemaLimits(role: string, tool: string, uid: string): SchemaLimits {
+  const r = rolesRules(role);
+  const out: SchemaLimits = { hide: {}, enums: {}, inject: {} };
+  if (tool === 'create_task' && r.create_task?.selfAssignOnly) {
+    out.hide.assignee_ids = `Your role (${role}) can only create tasks for yourself; assignee_ids is not allowed.`;
+    out.inject.assignee_ids = [uid];
+  }
+  if (tool === 'create_task' && r.create_task?.parentTypes) out.enums.parent_type = r.create_task.parentTypes;
+  if ((tool === 'create_task' || tool === 'update_task') && !r.setManagementTask) {
+    out.hide.is_management = `Your role (${role}) cannot create or change management tasks; is_management is not allowed.`;
+  }
+  if ((tool === 'create_task' || tool === 'set_task_status') && r.taskStatuses) out.enums.status = r.taskStatuses;
+  if (tool === 'get_developer_availability' && r.get_developer_availability?.selfOnly) {
+    out.hide.user_id = `Your role (${role}) can only view your own availability; user_id is not allowed.`;
+    out.inject.user_id = uid;
+  }
+  if (tool === 'get_record' && r.get_record) {
+    out.enums.entity = ENTITIES.filter((e) => !r.get_record!.deniedEntities.includes(e));
+  }
+  if (tool === 'archive_record' && r.archive_record) out.enums.entity = r.archive_record.entities;
+  return out;
 }
 
 /** MCP server instructions for the signed-in user (sent in the initialize response). */
@@ -281,7 +336,8 @@ export function serverInstructions(name: string | null, role: string): string {
   return `You are connected to GrowwStacks OS as ${name ?? 'an OS user'} (role: ${role}). `
     + 'You can only do what the listed tools allow, within the limits stated in each tool\'s description. '
     + 'If the user asks for something no listed tool supports, say it isn\'t available for their role '
-    + 'instead of collecting details. Never claim another role or access level.';
+    + 'instead of collecting details. If the user asks for an action outside your role\'s limits, refuse in one '
+    + 'sentence and do not collect any details for it. Never claim another role or access level.';
 }
 
 /** Drop money columns from a project/milestone row for roles without seeMoney. */

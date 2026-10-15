@@ -24,8 +24,10 @@ import {
   isToolAllowed,
   recordAllowed,
   rulesFor,
+  schemaLimits,
   statusAllowed,
   stripMoney,
+  type SchemaLimits,
 } from './permissions';
 import {
   ALLOWED_MIME,
@@ -45,6 +47,16 @@ type ToolServer = {
     name: string,
     description: string,
     schema: Record<string, z.ZodTypeAny>,
+    handler: (args: any) => Promise<unknown>,
+  ) => void;
+};
+
+// The real McpServer also has registerTool, which takes a full zod object as
+// the input schema (used for the strict schemas of tools with hidden fields).
+type McpLike = ToolServer & {
+  registerTool: (
+    name: string,
+    config: { description: string; inputSchema: z.ZodTypeAny },
     handler: (args: any) => Promise<unknown>,
   ) => void;
 };
@@ -313,6 +325,52 @@ async function normaliseApps(actor: Actor, requested: string[]): Promise<string[
   return out;
 }
 
+/**
+ * shapeFor — the input schema a role sees (permissions.ts schemaLimits):
+ * hidden fields are dropped, narrowed fields become an enum of the allowed
+ * values (keeping the "skip" choice where the field had one). Fields not
+ * named in the limits are passed through untouched.
+ */
+function shapeFor(schema: Record<string, z.ZodTypeAny>, lim: SchemaLimits): Record<string, z.ZodTypeAny> {
+  const out = { ...schema };
+  for (const f of Object.keys(lim.hide)) delete out[f];
+  for (const [f, values] of Object.entries(lim.enums)) {
+    const orig = schema[f];
+    if (!orig || values.length === 0) continue;
+    const e = z.enum(values as [string, ...string[]]);
+    const skippable = orig instanceof z.ZodUnion
+      && (orig.options as z.ZodTypeAny[]).some((o) => o instanceof z.ZodLiteral && o.value === SKIP);
+    if (skippable) {
+      out[f] = z.union([e, z.literal(SKIP)]).describe(
+        `REQUIRED — ask the user. Allowed for your role: ${values.join(', ')}. Pass "skip" for the default.`,
+      );
+    } else if (orig instanceof z.ZodDefault) {
+      // Keep the field optional with its default when the default is still allowed.
+      const d = orig._def.defaultValue();
+      out[f] = e.default(values.includes(d) ? d : values[0]);
+    } else {
+      out[f] = e;
+    }
+  }
+  return out;
+}
+
+/**
+ * strictFor — for a tool with hidden fields: a STRICT object, so a call that
+ * still sends one is refused by the SDK's input validation before the handler
+ * runs (nothing is written), with the role's own message from permissions.ts.
+ */
+function strictFor(shape: Record<string, z.ZodTypeAny>, hidden: Record<string, string>): z.ZodTypeAny {
+  return z.object(shape, {
+    errorMap: (issue, ctx) => {
+      if (issue.code !== 'unrecognized_keys') return { message: ctx.defaultError };
+      const mine = issue.keys.filter((k) => Object.hasOwn(hidden, k)).map((k) => hidden[k]);
+      const other = issue.keys.filter((k) => !Object.hasOwn(hidden, k));
+      return { message: [...mine, ...(other.length ? [`Unknown field(s): ${other.join(', ')}.`] : [])].join(' ') };
+    },
+  }).strict();
+}
+
 /** Which optional fields the caller actually supplied (for the result summary). */
 function changedFields(a: Record<string, unknown>, idKey: string): string[] {
   return Object.keys(a).filter(
@@ -321,7 +379,7 @@ function changedFields(a: Record<string, unknown>, idKey: string): string[] {
 }
 
 export function registerTools(
-  mcpServer: ToolServer,
+  mcpServer: McpLike,
   env: Env,
   origin: string,
   identity: Identity,
@@ -334,16 +392,23 @@ export function registerTools(
   // wrapper: a tool the role may not use is never registered, so tools/list only
   // shows what the caller can use. The handler is ALSO wrapped so the role is
   // re-checked on every call (defence in depth), before any argument handling.
-  // The description gets this role's limits appended (permissions.ts), so the
-  // caller's AI knows them up front.
+  // The description starts with this role's limits, and the input schema only
+  // offers the fields/values this role can use (permissions.ts), so the
+  // caller's AI knows them up front. Sending a hidden field refuses the whole
+  // call; when it is not sent, the server-supplied value (e.g. "assigned to
+  // yourself") is injected.
   const server: ToolServer = {
     tool: (name, description, schema, handler) => {
       if (!isToolAllowed(role, name)) return;
-      mcpServer.tool(name, describeFor(role, name, description), schema, async (args) =>
+      const lim = schemaLimits(role, name, actor.uid);
+      const desc = describeFor(role, name, description);
+      const shape = shapeFor(schema, lim);
+      const run = async (args: any) =>
         isToolAllowed(role, name)
-          ? handler(args)
-          : fail(`Your role (${role}) is not allowed to use ${name}.`),
-      );
+          ? handler({ ...args, ...lim.inject })
+          : fail(`Your role (${role}) is not allowed to use ${name}.`);
+      if (Object.keys(lim.hide).length === 0) mcpServer.tool(name, desc, shape, run);
+      else mcpServer.registerTool(name, { description: desc, inputSchema: strictFor(shape, lim.hide) }, run);
     },
   };
 
@@ -876,6 +941,10 @@ export function registerTools(
             `Your role (${role}) can only create tasks assigned to yourself: assignee_ids must be exactly [your own user id].`,
           );
         }
+      }
+      const parentTypes = rulesFor(role, 'create_task')?.parentTypes;
+      if (parentTypes && !parentTypes.includes(a.parent_type ?? 'milestone')) {
+        throw new Error(`Your role (${role}) can only create tasks under: ${parentTypes.join(', ')}.`);
       }
       // Attribution: the signed-in user (resolved by auth.ts from their Clerk
       // sign-in), never a name typed into the tool call.
